@@ -1,0 +1,320 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ReAct Agent</title>
+<style>
+  :root {
+    --bg: #f6f7f9;
+    --card: #ffffff;
+    --ink: #1f2328;
+    --muted: #6b7280;
+    --line: #e5e7eb;
+    --accent: #2563eb;
+    --green: #059669;
+    --amber: #b45309;
+    --red: #dc2626;
+    --purple: #7c3aed;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+  }
+  main { max-width: 860px; margin: 0 auto; padding: 28px 20px 140px; }
+  header h1 { margin: 0 0 4px; font-size: 22px; }
+  .sub { margin: 0; color: var(--muted); font-size: 13px; }
+  .meta { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 16px 0; min-height: 24px; }
+  .chip {
+    background: #eef2ff; color: #3730a3;
+    border-radius: 999px; padding: 2px 10px; font-size: 12px;
+  }
+  .chip.status { background: #f3f4f6; color: #4b5563; }
+  .chip.status.run { background: #fef3c7; color: #92400e; }
+  .chip.status.ok { background: #d1fae5; color: #065f46; }
+  .chip.status.err { background: #fee2e2; color: #991b1b; }
+  .trace { display: flex; flex-direction: column; gap: 12px; }
+  .empty { color: var(--muted); font-size: 14px; margin: 8px 0; }
+  .empty code { background: #eef2ff; color: #3730a3; padding: 1px 6px; border-radius: 6px; font-size: 13px; }
+  .step { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; }
+  .step-head {
+    color: var(--muted); font-size: 12px; font-weight: 600;
+    letter-spacing: .05em; margin-bottom: 8px;
+  }
+  .block { border-radius: 8px; padding: 8px 10px; margin-top: 8px; }
+  .block .label {
+    font-size: 11px; font-weight: 700; letter-spacing: .05em;
+    margin-bottom: 4px;
+  }
+  .block pre { margin: 0; white-space: pre-wrap; word-break: break-word;
+    font: 13px/1.55 ui-monospace, SFMono-Regular, Consolas, monospace; }
+  .thought { background: #f5f3ff; }
+  .thought .label { color: var(--purple); }
+  .tool { background: #eff6ff; }
+  .tool .label { color: var(--accent); }
+  .observation { background: #ecfdf5; }
+  .observation .label { color: var(--green); }
+  .notice { background: #fffbeb; }
+  .notice .label { color: var(--amber); }
+  .error { background: #fef2f2; }
+  .error .label { color: var(--red); }
+  .final { background: var(--card); border: 1px solid #bfdbfe; border-radius: 12px; padding: 14px; }
+  .final .label {
+    color: var(--accent); font-size: 12px; font-weight: 700;
+    letter-spacing: .05em; margin-bottom: 6px;
+  }
+  .final .answer { white-space: pre-wrap; font-size: 17px; font-weight: 600; }
+  .final .stats { color: var(--muted); font-size: 12px; margin-top: 8px; }
+  .ask {
+    position: fixed; left: 0; right: 0; bottom: 0;
+    background: linear-gradient(transparent, var(--bg) 32%);
+    padding: 22px 20px 18px;
+  }
+  .ask-inner { max-width: 860px; margin: 0 auto; display: flex; gap: 8px; }
+  #question {
+    flex: 1; padding: 12px 14px; border: 1px solid var(--line); border-radius: 10px;
+    background: #fff; color: var(--ink); font-size: 15px; outline: none;
+  }
+  #question:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(37, 99, 235, .12); }
+  button { border: 0; border-radius: 10px; padding: 12px 20px; font-size: 15px; cursor: pointer; }
+  #send { background: var(--accent); color: #fff; }
+  #send:disabled { opacity: .55; cursor: default; }
+  #stop { background: #e5e7eb; color: #374151; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>ReAct Agent</h1>
+    <p class="sub">思考 → 行动 → 观察，过程实时输出</p>
+  </header>
+
+  <div id="meta" class="meta"></div>
+
+  <div id="trace" class="trace">
+    <p class="empty">输入问题开始，例如：<code>237 + 45 乘以 1.13 等于多少？</code></p>
+  </div>
+</main>
+
+<div class="ask">
+  <div class="ask-inner">
+    <input id="question" placeholder="输入问题，回车发送" autocomplete="off">
+    <button id="stop" type="button" hidden>停止</button>
+    <button id="send" type="submit" form="ask-form">发送</button>
+  </div>
+</div>
+<form id="ask-form" hidden></form>
+
+<script>
+(() => {
+  const metaEl = document.getElementById('meta');
+  const traceEl = document.getElementById('trace');
+  const form = document.getElementById('ask-form');
+  const input = document.getElementById('question');
+  const sendBtn = document.getElementById('send');
+  const stopBtn = document.getElementById('stop');
+
+  let controller = null;
+  let running = false;
+  let stepCard = null;
+  let statusEl = null;
+  let statusKind = '';
+  let startedAt = 0;
+  let gotDone = false;
+
+  const el = (tag, cls, text) => {
+    const node = document.createElement(tag);
+    if (cls) node.className = cls;
+    if (text !== undefined) node.textContent = text;
+    return node;
+  };
+
+  const scrollDown = () => window.scrollTo(0, document.body.scrollHeight);
+
+  function setStatus(text, kind) {
+    if (!statusEl || !statusEl.isConnected) {
+      statusEl = el('span');
+      metaEl.append(statusEl);
+    }
+    statusEl.textContent = text;
+    statusEl.className = 'chip status ' + (kind || '');
+    statusKind = kind || '';
+  }
+
+  function addBlock(parent, kind, label, text) {
+    const block = el('div', 'block ' + kind);
+    block.append(el('div', 'label', label));
+    const pre = el('pre');
+    pre.textContent = text;
+    block.append(pre);
+    parent.append(block);
+    scrollDown();
+  }
+
+  function newStep(step, maxSteps) {
+    const card = el('section', 'step');
+    card.append(el('div', 'step-head', '第 ' + step + ' / ' + maxSteps + ' 步'));
+    const thought = el('div', 'block thought');
+    thought.append(el('div', 'label', '模型输出'));
+    const pre = el('pre');
+    thought.append(pre);
+    thought.hidden = true;
+    card.append(thought);
+    traceEl.append(card);
+    stepCard = { card, thought, pre };
+    scrollDown();
+  }
+
+  function onDelta(text) {
+    if (!stepCard) newStep('?', '?');
+    stepCard.thought.hidden = false;
+    stepCard.pre.textContent += text;
+    scrollDown();
+  }
+
+  function onDone(data) {
+    gotDone = true;
+    const card = el('section', 'final');
+    card.append(el('div', 'label', '最终回答'));
+    card.append(el('div', 'answer', data.answer || '(无)'));
+    const seconds = ((Date.now() - startedAt) / 1000).toFixed(1);
+    card.append(el('div', 'stats',
+      (data.solved ? '已解决' : '未完全解决') + ' · ' + data.stopReason +
+      ' · ' + data.stepCount + ' 次工具调用 · 用时 ' + seconds + ' 秒'));
+    traceEl.append(card);
+    setStatus(data.solved ? '完成' : '步数用尽', data.solved ? 'ok' : 'run');
+    scrollDown();
+  }
+
+  function handleEvent(name, data) {
+    switch (name) {
+      case 'start':
+        setStatus('运行中 · 最多 ' + data.maxSteps + ' 步', 'run');
+        break;
+      case 'step':
+        newStep(data.step, data.maxSteps);
+        break;
+      case 'delta':
+        onDelta(data.text);
+        break;
+      case 'action':
+        if (stepCard) addBlock(stepCard.card, 'tool', '工具调用 · ' + data.tool, data.input || '(无参数)');
+        break;
+      case 'observation':
+        addBlock(stepCard ? stepCard.card : traceEl, 'observation', '工具结果', data.text);
+        break;
+      case 'notice':
+        addBlock(stepCard ? stepCard.card : traceEl, 'notice', '提示', data.message);
+        break;
+      case 'done':
+        onDone(data);
+        break;
+      case 'error':
+        addBlock(traceEl, 'error', '错误', data.message);
+        setStatus('出错', 'err');
+        break;
+    }
+  }
+
+  function handleFrame(frame) {
+    let event = 'message';
+    const dataLines = [];
+    for (const line of frame.split('\n')) {
+      if (line.startsWith('event:')) event = line.slice(6).trim();
+      else if (line.startsWith('data:')) dataLines.push(line.slice(5).replace(/^ /, ''));
+    }
+    if (!dataLines.length) return;
+    let data;
+    try { data = JSON.parse(dataLines.join('\n')); } catch (_) { return; }
+    handleEvent(event, data);
+  }
+
+  function finish() {
+    running = false;
+    sendBtn.disabled = false;
+    stopBtn.hidden = true;
+    controller = null;
+    stepCard = null;
+    input.focus();
+  }
+
+  async function ask(question) {
+    running = true;
+    gotDone = false;
+    stepCard = null;
+    startedAt = Date.now();
+    sendBtn.disabled = true;
+    stopBtn.hidden = false;
+    traceEl.replaceChildren();
+    setStatus('连接中…', 'run');
+    controller = new AbortController();
+
+    try {
+      const res = await fetch('/api/agent/ask/stream', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ question }),
+        signal: controller.signal
+      });
+      if (!res.ok) {
+        let message = 'HTTP ' + res.status;
+        try {
+          const body = await res.json();
+          message = body.error || body.message || message;
+        } catch (_) { /* 非 JSON 错误体 */ }
+        throw new Error(message);
+      }
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
+        let index;
+        while ((index = buffer.indexOf('\n\n')) >= 0) {
+          handleFrame(buffer.slice(0, index));
+          buffer = buffer.slice(index + 2);
+        }
+      }
+      if (buffer.trim()) handleFrame(buffer);
+      if (!gotDone && statusKind === 'run') setStatus('已结束', '');
+    } catch (err) {
+      if (controller && controller.signal.aborted) {
+        addBlock(traceEl, 'notice', '已停止', '请求已中止，后台会随下次发送失败退出');
+        setStatus('已停止', '');
+      } else {
+        addBlock(traceEl, 'error', '请求失败', err.message || String(err));
+        setStatus('出错', 'err');
+      }
+    } finally {
+      finish();
+    }
+  }
+
+  form.addEventListener('submit', (e) => {
+    e.preventDefault();
+    const question = input.value.trim();
+    if (!question || running) return;
+    input.value = '';
+    ask(question);
+  });
+
+  stopBtn.addEventListener('click', () => {
+    if (controller) controller.abort();
+  });
+
+  fetch('/api/tools')
+    .then(r => r.json())
+    .then(tools => {
+      tools.forEach(t => metaEl.append(el('span', 'chip', '工具 · ' + t.name)));
+      setStatus('就绪', '');
+    })
+    .catch(() => setStatus('就绪', ''));
+})();
+</script>
+</body>
+</html>

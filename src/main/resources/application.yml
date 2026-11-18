@@ -9,15 +9,15 @@ agent:
   # 任何 OpenAI 兼容网关都可以：阿里云百炼 / DeepSeek / Moonshot / OpenAI / 本地 Ollama
   base-url: ${OPENAI_BASE_URL:https://dashscope.aliyuncs.com/compatible-mode/v1}
   api-key: ${API_KEY:}
-  model: ${OPENAI_MODEL:kimi-k3}
+  model: ${OPENAI_MODEL:glm-5.3}
 #  temperature: 0.2
   max-steps: 6
   # 模型一次只返回 "思考 + 一个动作"，靠多轮把任务拆下去
   max-observation-chars: 1200
   connect-timeout: 10s
   read-timeout: 90s
-  # 关掉后只保留 HTTP 入口（POST /api/agent/ask）
-  cli-enabled: true
+  # 关掉控制台交互，只保留网页和 HTTP 入口（POST /api/agent/ask）
+  cli-enabled: false
 
 logging:
   level:

@@ -3,6 +3,7 @@ package com.example.agent.cli;
 import java.io.PrintStream;
 import java.util.Scanner;
 
+import com.example.agent.agent.AgentListener;
 import com.example.agent.agent.AgentRunResult;
 import com.example.agent.agent.ReactAgent;
 import com.example.agent.config.AgentProperties;
@@ -15,6 +16,7 @@ import org.springframework.stereotype.Component;
 
 /**
  * 命令行入口：java -jar 后面直接跟问题，或不带参数进入交互模式。
+ * 运行过程实时打印：模型输出逐字流出，工具名、参数、结果即时可见。
  */
 @Component
 @ConditionalOnProperty(name = "agent.cli-enabled", havingValue = "true", matchIfMissing = true)
@@ -67,7 +69,7 @@ class AgentCliRunner implements ApplicationRunner {
     private void askAndPrint(String question, PrintStream out) {
         long started = System.currentTimeMillis();
         try {
-            AgentRunResult result = agent.run(question);
+            AgentRunResult result = agent.run(question, new ConsoleListener(out));
             out.printf("""
 
                     ================= 结论 =================
@@ -84,6 +86,66 @@ class AgentCliRunner implements ApplicationRunner {
         } catch (RuntimeException ex) {
             out.println("运行失败: " + ex.getMessage());
             log.warn("Agent 运行异常", ex);
+        }
+    }
+
+    /** 逐字打印模型输出，并在工具执行前后打印结构化信息。 */
+    private static final class ConsoleListener implements AgentListener {
+
+        private final PrintStream out;
+        private boolean midLine;
+
+        ConsoleListener(PrintStream out) {
+            this.out = out;
+        }
+
+        @Override
+        public void onStepStart(int step, int maxSteps) {
+            newLineIfNeeded();
+            out.printf("%n---- 第 %d/%d 步 ----%n", step, maxSteps);
+        }
+
+        @Override
+        public void onModelDelta(String delta) {
+            out.print(delta);
+            out.flush();
+            midLine = !delta.endsWith("\n");
+        }
+
+        @Override
+        public void onModelComplete(String raw) {
+            newLineIfNeeded();
+        }
+
+        @Override
+        public void onAction(String tool, String input) {
+            out.printf("[工具] %s%n[参数] %s%n", tool, input);
+            out.flush();
+        }
+
+        @Override
+        public void onObservation(String observation) {
+            out.printf("[结果] %s%n", observation);
+            out.flush();
+        }
+
+        @Override
+        public void onNotice(String message) {
+            out.printf("[提示] %s%n", message);
+            out.flush();
+        }
+
+        @Override
+        public void onError(RuntimeException error) {
+            out.printf("[错误] %s%n", error.getMessage());
+            out.flush();
+        }
+
+        private void newLineIfNeeded() {
+            if (midLine) {
+                out.println();
+                midLine = false;
+            }
         }
     }
 }

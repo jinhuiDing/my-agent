@@ -20,7 +20,8 @@ import org.springframework.stereotype.Service;
  *   -> 执行工具拿到 Observation -> 追加进历史 -> 直到 Final Answer 或步数用尽
  * </pre>
  *
- * 没有记忆、没有并行、没有反思，第一版就这样。
+ * 运行过程通过 AgentListener 实时广播：CLI 逐字打印，HTTP 端点推 SSE；
+ * 不传监听器时退回日志输出。
  */
 @Service
 public class ReactAgent {
@@ -43,26 +44,31 @@ public class ReactAgent {
     }
 
     public AgentRunResult run(String question) {
+        return run(question, new LoggingAgentListener());
+    }
+
+    public AgentRunResult run(String question, AgentListener listener) {
         List<Step> history = new ArrayList<>();
-        log.info("""
-                ============== 新任务 ==============
-                问题: {}
-                工具: {}""", question.trim(), tools.names());
+        listener.onRunStart(question, tools.names(), properties.maxSteps());
 
         for (int step = 1; step <= properties.maxSteps(); step++) {
+            listener.onStepStart(step, properties.maxSteps());
             String system = prompt.system();
             String user = prompt.user(question, history, step);
-            String raw = llm.complete(system, user);
+            String raw;
+            try {
+                raw = llm.completeStream(system, user, listener::onModelDelta);
+            } catch (RuntimeException ex) {
+                listener.onError(ex);
+                throw ex;
+            }
+            listener.onModelComplete(raw);
             ParsedStep parsed = parser.parse(raw);
 
-            log.info("""
-                    ---------- 第 {}/{} 步 ----------
-                    模型原文:
-                    {}""", step, properties.maxSteps(), raw);
-
             if (parsed.isFinal()) {
-                log.info("[完成] 拿到 Final Answer，共 {} 步", step);
-                return new AgentRunResult(question, parsed.finalAnswer(), history, true, "final_answer");
+                AgentRunResult result = new AgentRunResult(question, parsed.finalAnswer(), history, true, "final_answer");
+                listener.onDone(result);
+                return result;
             }
 
             String observation;
@@ -71,25 +77,29 @@ public class ReactAgent {
             if (!parsed.hasAction()) {
                 observation = "格式错误: 你的回复里既没有 Action/Action Input，也没有 Final Answer。"
                         + "请重新严格按格式 A 或格式 B 输出，只输出一步。";
+                listener.onNotice(observation);
             } else {
                 Tool tool = tools.find(parsed.action()).orElse(null);
                 if (tool == null) {
                     observation = parser.unknownToolObservation(parsed.action());
+                    listener.onNotice(observation);
                 } else {
                     actionName = tool.name();
-                    log.info("[执行] {} <- {}", actionName, actionInput);
+                    listener.onAction(actionName, actionInput == null ? "" : actionInput);
                     observation = truncate(call(tool, actionInput), properties.maxObservationChars());
                 }
             }
 
             history.add(new Step(parsed.thought(), actionName, actionInput, observation));
-            log.info("[观察] {}", observation);
+            listener.onObservation(observation);
         }
 
         // 步数用尽：强行让它别再调工具，把已经拿到的信息总结成答案
-        String forced = summarizeWithoutTools(question, history);
-        log.info("[停止] 已达最大步数 {}，用已有观察直接作答", properties.maxSteps());
-        return new AgentRunResult(question, forced, history, false, "max_steps_reached");
+        listener.onNotice("已达最大步数 " + properties.maxSteps() + "，不再调用工具，用已有信息收尾");
+        String forced = summarizeWithoutTools(question, history, listener);
+        AgentRunResult result = new AgentRunResult(question, forced, history, false, "max_steps_reached");
+        listener.onDone(result);
+        return result;
     }
 
     private String call(Tool tool, String input) {
@@ -102,16 +112,20 @@ public class ReactAgent {
         }
     }
 
-    private String summarizeWithoutTools(String question, List<Step> history) {
+    private String summarizeWithoutTools(String question, List<Step> history, AgentListener listener) {
         String user = prompt.user(question, history, history.size() + 1)
                 + "\n\n补充要求: 不允许再调用工具，直接输出 Final Answer，基于上面已有信息尽量回答，并指出还缺什么。";
+        ParsedStep parsed;
         try {
-            ParsedStep parsed = parser.parse(llm.complete(prompt.system(), user));
-            if (parsed.finalAnswer() != null) {
-                return parsed.finalAnswer();
-            }
+            parsed = parser.parse(llm.completeStream(prompt.system(), user, listener::onModelDelta));
         } catch (RuntimeException ex) {
-            log.warn("收尾总结失败: {}", ex.toString());
+            listener.onNotice("收尾总结失败: " + ex.getMessage());
+            return "步数已用完，没能得到最终答案。最后一步的观察是："
+                    + (history.isEmpty() ? "(无)" : history.get(history.size() - 1).observation());
+        }
+        listener.onModelComplete(parsed.raw());
+        if (parsed.finalAnswer() != null) {
+            return parsed.finalAnswer();
         }
         return "步数已用完，没能得到最终答案。最后一步的观察是："
                 + (history.isEmpty() ? "(无)" : history.get(history.size() - 1).observation());
