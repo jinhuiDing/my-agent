@@ -1,10 +1,12 @@
 package com.example.agent.agent;
 
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 
 import com.example.agent.agent.ReActParser.ParsedStep;
 import com.example.agent.config.AgentProperties;
+import com.example.agent.context.AgentRunContext;
 import com.example.agent.llm.LlmClient;
 import com.example.agent.tool.Tool;
 import com.example.agent.tool.ToolRegistry;
@@ -19,7 +21,7 @@ import org.springframework.stereotype.Service;
  *   拼 prompt（问题 + 历史） -> 问模型下一步 -> 解析出 Action
  *   -> 执行工具拿到 Observation -> 追加进历史 -> 直到 Final Answer 或步数用尽
  * </pre>
- *
+ * <p>
  * 运行过程通过 AgentListener 实时广播：CLI 逐字打印，HTTP 端点推 SSE；
  * 不传监听器时退回日志输出。
  */
@@ -48,13 +50,16 @@ public class ReactAgent {
     }
 
     public AgentRunResult run(String question, AgentListener listener) {
-        List<Step> history = new ArrayList<>();
-        listener.onRunStart(question, tools.names(), properties.maxSteps());
 
-        for (int step = 1; step <= properties.maxSteps(); step++) {
-            listener.onStepStart(step, properties.maxSteps());
+        AgentRunContext context = new AgentRunContext(question, properties.maxSteps());
+
+        listener.onRunStart(question, tools.names(), context.getMaxSteps());
+        while (context.getCurrentStep() < context.getMaxSteps()) {
+            int step = context.nextStep();
+            listener.onStepStart(step, context.getMaxSteps());
+
             String system = prompt.system();
-            String user = prompt.user(question, history, step);
+            String user = prompt.user(context.getQuestion(), context.getHistory(), step);
             String raw;
             try {
                 raw = llm.completeStream(system, user, listener::onModelDelta);
@@ -66,7 +71,7 @@ public class ReactAgent {
             ParsedStep parsed = parser.parse(raw);
 
             if (parsed.isFinal()) {
-                AgentRunResult result = new AgentRunResult(question, parsed.finalAnswer(), history, true, "final_answer");
+                AgentRunResult result = new AgentRunResult(question, parsed.finalAnswer(), context.getHistory(), true, "final_answer");
                 listener.onDone(result);
                 return result;
             }
@@ -90,14 +95,14 @@ public class ReactAgent {
                 }
             }
 
-            history.add(new Step(parsed.thought(), actionName, actionInput, observation));
+            context.addStep(new Step(parsed.thought(), actionName, actionInput, observation));
             listener.onObservation(observation);
         }
 
         // 步数用尽：强行让它别再调工具，把已经拿到的信息总结成答案
         listener.onNotice("已达最大步数 " + properties.maxSteps() + "，不再调用工具，用已有信息收尾");
-        String forced = summarizeWithoutTools(question, history, listener);
-        AgentRunResult result = new AgentRunResult(question, forced, history, false, "max_steps_reached");
+        String forced = summarizeWithoutTools(question, context.getHistory(), listener);
+        AgentRunResult result = new AgentRunResult(question, forced, context.getHistory(), false, "max_steps_reached");
         listener.onDone(result);
         return result;
     }
