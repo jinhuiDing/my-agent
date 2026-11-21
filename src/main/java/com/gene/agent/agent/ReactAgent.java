@@ -64,7 +64,7 @@ public class ReactAgent {
 
                 String system = prompt.system();
                 String user = prompt.user(context.getQuestion(), context.getHistory(), step);
-                LlmRequest llmRequest = new LlmRequest(system, user, ResponseFormat.jsonSchema("agent_output", AgentOutputSchema.SCHEMA));
+                LlmRequest llmRequest = new LlmRequest(system, user, ResponseFormat.jsonSchema("agent_output", AgentOutputSchema.build(tools.all())));
                 String raw = llm.completeStream(llmRequest, listener::onModelDelta);
 
                 listener.onModelComplete(raw);
@@ -143,12 +143,22 @@ public class ReactAgent {
     }
 
     private String call(Tool tool, JsonNode input) {
+        if (input == null || !input.isObject()) {
+            return "工具参数格式错误：input 必须是 JSON 对象";
+        }
+
         try {
             String observation = tool.execute(input);
-            return observation == null || observation.isBlank() ? "工具执行成功但没有返回内容" : observation;
+
+            return observation == null || observation.isBlank()
+                    ? "工具执行成功但没有返回内容"
+                    : observation;
+
         } catch (RuntimeException ex) {
             log.warn("工具 {} 执行异常", tool.name(), ex);
-            return "工具执行失败: " + (ex.getMessage() == null ? ex.toString() : ex.getMessage());
+
+            return "工具执行失败: "
+                    + (ex.getMessage() == null ? ex.toString() : ex.getMessage());
         }
     }
 

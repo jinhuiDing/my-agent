@@ -1,6 +1,8 @@
 package com.gene.agent.tool;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.JsonNodeFactory;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.springframework.stereotype.Component;
 
 /**
@@ -13,6 +15,24 @@ public class CalculatorTool implements Tool {
     @Override
     public String name() {
         return "calculator";
+    }
+
+    @Override
+    public JsonNode inputSchema() {
+        ObjectNode schema = JsonNodeFactory.instance.objectNode();
+
+        schema.put("type", "object");
+
+        ObjectNode properties = schema.putObject("properties");
+
+        ObjectNode city = properties.putObject("expression");
+        city.put("type", "string");
+        city.put("description", "算数表达式");
+
+        schema.putArray("required").add("expression");
+        schema.put("additionalProperties", false);
+
+        return schema;
     }
 
     @Override

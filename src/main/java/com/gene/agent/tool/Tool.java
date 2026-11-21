@@ -9,6 +9,10 @@ import com.fasterxml.jackson.databind.JsonNode;
 public interface Tool {
 
     String name();
+    /**
+     * 工具输入参数的 JSON Schema
+     */
+    JsonNode inputSchema();
 
     String description();
 

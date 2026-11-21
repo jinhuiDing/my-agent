@@ -49,4 +49,9 @@ public class ToolRegistry {
     public List<String> names() {
         return List.copyOf(tools.keySet());
     }
+
+
+    public List<Tool> all() {
+        return List.copyOf(tools.values());
+    }
 }

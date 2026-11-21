@@ -11,6 +11,9 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.JsonNodeFactory;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.gene.agent.config.AgentProperties;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -51,7 +54,36 @@ public class SearchTool implements Tool {
         factory.setReadTimeout(properties.readTimeout());
         this.restClient = RestClient.builder().requestFactory(factory).build();
     }
+    @Override
+    public JsonNode inputSchema() {
+        ObjectNode schema = JsonNodeFactory.instance.objectNode();
 
+        schema.put("type", "object");
+
+        ObjectNode properties = schema.putObject("properties");
+
+        ObjectNode city = properties.putObject("city");
+        city.put("type", "string");
+        city.put("description", "城市名称");
+
+        schema.putArray("required").add("city");
+        schema.put("additionalProperties", false);
+
+        return schema;
+//        return objectMapper.readTree("""
+//        {
+//          "type": "object",
+//          "properties": {
+//            "city": {
+//              "type": "string",
+//              "description": "城市名称"
+//            }
+//          },
+//          "required": ["city"],
+//          "additionalProperties": false
+//        }
+//        """);
+    }
     @Override
     public String name() {
         return "search";
