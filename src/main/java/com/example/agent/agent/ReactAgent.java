@@ -1,13 +1,12 @@
 package com.example.agent.agent;
 
-import java.time.Instant;
-import java.util.ArrayList;
 import java.util.List;
 
 import com.example.agent.agent.ReActParser.ParsedStep;
 import com.example.agent.config.AgentProperties;
-import com.example.agent.context.AgentRunContext;
+import com.example.agent.runtime.AgentRunContext;
 import com.example.agent.llm.LlmClient;
+import com.example.agent.runtime.AgentRunStatus;
 import com.example.agent.tool.Tool;
 import com.example.agent.tool.ToolRegistry;
 import org.slf4j.Logger;
@@ -50,61 +49,69 @@ public class ReactAgent {
     }
 
     public AgentRunResult run(String question, AgentListener listener) {
-
         AgentRunContext context = new AgentRunContext(question, properties.maxSteps());
+        context.start();
+        try {
+            listener.onRunStart(question, tools.names(), context.getMaxSteps());
 
-        listener.onRunStart(question, tools.names(), context.getMaxSteps());
-        while (context.getCurrentStep() < context.getMaxSteps()) {
-            int step = context.nextStep();
-            listener.onStepStart(step, context.getMaxSteps());
+            while (context.getCurrentStep() < context.getMaxSteps()) {
+                int step = context.nextStep();
+                listener.onStepStart(step, context.getMaxSteps());
 
-            String system = prompt.system();
-            String user = prompt.user(context.getQuestion(), context.getHistory(), step);
-            String raw;
-            try {
-                raw = llm.completeStream(system, user, listener::onModelDelta);
-            } catch (RuntimeException ex) {
-                listener.onError(ex);
-                throw ex;
-            }
-            listener.onModelComplete(raw);
-            ParsedStep parsed = parser.parse(raw);
+                String system = prompt.system();
+                String user = prompt.user(context.getQuestion(), context.getHistory(), step);
+                String raw = llm.completeStream(system, user, listener::onModelDelta);
 
-            if (parsed.isFinal()) {
-                AgentRunResult result = new AgentRunResult(question, parsed.finalAnswer(), context.getHistory(), true, "final_answer");
-                listener.onDone(result);
-                return result;
-            }
+                listener.onModelComplete(raw);
+                ParsedStep parsed = parser.parse(raw);
 
-            String observation;
-            String actionName = null;
-            String actionInput = parsed.actionInput();
-            if (!parsed.hasAction()) {
-                observation = "格式错误: 你的回复里既没有 Action/Action Input，也没有 Final Answer。"
-                        + "请重新严格按格式 A 或格式 B 输出，只输出一步。";
-                listener.onNotice(observation);
-            } else {
-                Tool tool = tools.find(parsed.action()).orElse(null);
-                if (tool == null) {
-                    observation = parser.unknownToolObservation(parsed.action());
+                if (parsed.isFinal()) {
+                    AgentRunResult result = new AgentRunResult(question, parsed.finalAnswer(), context.getHistory(), true, "final_answer");
+                    context.complete();
+                    listener.onDone(result);
+                    return result;
+                }
+
+                String observation;
+                String actionName = null;
+                String actionInput = parsed.actionInput();
+                if (!parsed.hasAction()) {
+                    observation = "格式错误: 你的回复里既没有 Action/Action Input，也没有 Final Answer。"
+                            + "请重新严格按格式 A 或格式 B 输出，只输出一步。";
                     listener.onNotice(observation);
                 } else {
-                    actionName = tool.name();
-                    listener.onAction(actionName, actionInput == null ? "" : actionInput);
-                    observation = truncate(call(tool, actionInput), properties.maxObservationChars());
+                    Tool tool = tools.find(parsed.action()).orElse(null);
+                    if (tool == null) {
+                        observation = parser.unknownToolObservation(parsed.action());
+                        listener.onNotice(observation);
+                    } else {
+                        actionName = tool.name();
+                        listener.onAction(actionName, actionInput == null ? "" : actionInput);
+                        observation = truncate(call(tool, actionInput), properties.maxObservationChars());
+                    }
                 }
+
+                context.addStep(new Step(parsed.thought(), actionName, actionInput, observation));
+                listener.onObservation(observation);
             }
+            // 步数用尽：强行让它别再调工具，把已经拿到的信息总结成答案
+            listener.onNotice("已达最大步数 " + properties.maxSteps() + "，不再调用工具，用已有信息收尾");
+            String forced = summarizeWithoutTools(question, context.getHistory(), listener);
 
-            context.addStep(new Step(parsed.thought(), actionName, actionInput, observation));
-            listener.onObservation(observation);
+            context.finishByLimit();
+
+
+            AgentRunResult result = new AgentRunResult(question, forced, context.getHistory(), false, "max_steps_reached");
+            listener.onDone(result);
+            return result;
+        } catch (RuntimeException ex) {
+            if (context.getStatus()==AgentRunStatus.RUNNING) {
+                context.fail();
+            }
+            // todo 如果 listener.onError(ex) 自己也抛异常，那么原始异常 ex 可能被覆盖。
+            listener.onError(ex);
+            throw ex;
         }
-
-        // 步数用尽：强行让它别再调工具，把已经拿到的信息总结成答案
-        listener.onNotice("已达最大步数 " + properties.maxSteps() + "，不再调用工具，用已有信息收尾");
-        String forced = summarizeWithoutTools(question, context.getHistory(), listener);
-        AgentRunResult result = new AgentRunResult(question, forced, context.getHistory(), false, "max_steps_reached");
-        listener.onDone(result);
-        return result;
     }
 
     private String call(Tool tool, String input) {
