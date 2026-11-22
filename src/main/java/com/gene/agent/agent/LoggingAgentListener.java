@@ -38,6 +38,20 @@ class LoggingAgentListener implements AgentListener {
     }
 
     @Override
+    public void onToolStart(String tool, String input) {
+        log.info("[工具开始] {} 参数: {}", tool, input);
+    }
+
+    @Override
+    public void onToolComplete(String tool, boolean success, String result, long costMs) {
+        if (success) {
+            log.info("[工具完成] {} 耗时 {} ms: {}", tool, costMs, result);
+        } else {
+            log.warn("[工具失败] {} 耗时 {} ms: {}", tool, costMs, result);
+        }
+    }
+
+    @Override
     public void onObservation(String observation) {
         log.info("[观察] {}", observation);
     }

@@ -3,8 +3,8 @@ package com.gene.agent.agent;
 import java.util.List;
 
 import com.fasterxml.jackson.databind.JsonNode;
-import com.gene.agent.agent.ReActParser.ParsedStep;
 import com.gene.agent.config.AgentProperties;
+import com.gene.agent.exception.AgentOutputParseException;
 import com.gene.agent.llm.LlmRequest;
 import com.gene.agent.llm.ResponseFormat;
 import com.gene.agent.output.*;
@@ -12,6 +12,7 @@ import com.gene.agent.runtime.AgentRunContext;
 import com.gene.agent.llm.LlmClient;
 import com.gene.agent.runtime.AgentRunStatus;
 import com.gene.agent.tool.Tool;
+import com.gene.agent.tool.ToolInputValidator;
 import com.gene.agent.tool.ToolRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -33,19 +34,24 @@ public class ReactAgent {
 
     private static final Logger log = LoggerFactory.getLogger(ReactAgent.class);
 
+    /** 模型输出不符合 Schema 时的最大重试次数。 */
+    private static final int MAX_PARSE_RETRIES = 2;
+
     private final LlmClient llm;
     private final ReActPrompt prompt;
     private final AgentOutputParser parser;
     private final ToolRegistry tools;
     private final AgentProperties properties;
+    private final ToolInputValidator toolInputValidator;
 
     public ReactAgent(LlmClient llm, ReActPrompt prompt, AgentOutputParser parser,
-                      ToolRegistry tools, AgentProperties properties) {
+                      ToolRegistry tools, AgentProperties properties, ToolInputValidator toolInputValidator) {
         this.llm = llm;
         this.prompt = prompt;
         this.parser = parser;
         this.tools = tools;
         this.properties = properties;
+        this.toolInputValidator = toolInputValidator;
     }
 
     public AgentRunResult run(String question) {
@@ -64,12 +70,7 @@ public class ReactAgent {
 
                 String system = prompt.system();
                 String user = prompt.user(context.getQuestion(), context.getHistory(), step);
-                LlmRequest llmRequest = new LlmRequest(system, user, ResponseFormat.jsonSchema("agent_output", outputSchema));
-                String raw = llm.completeStream(llmRequest, listener::onModelDelta);
-
-                listener.onModelComplete(raw);
-
-                AgentOutput output = parser.parse(raw,outputSchema);
+                AgentOutput output = askModel(system, user, outputSchema, listener);
 
                 if (output instanceof FinalOutput(String answer)) {
                     AgentRunResult result = new AgentRunResult(
@@ -104,7 +105,7 @@ public class ReactAgent {
                     listener.onAction(actionName, actionInput);
 
                     observation = truncate(
-                            call(tool, action.input()),
+                            call(tool, action.input(),listener),
                             properties.maxObservationChars()
                     );
                 }
@@ -142,23 +143,92 @@ public class ReactAgent {
         }
     }
 
-    private String call(Tool tool, JsonNode input) {
-        if (input == null || !input.isObject()) {
-            return "工具参数格式错误：input 必须是 JSON 对象";
+    /**
+     * 请求模型并解析输出；当输出不符合 Schema 时把校验错误反馈给模型重试，
+     * 避免单次格式偏差（如空的 final answer）直接让整次运行崩溃。
+     */
+    private AgentOutput askModel(String system, String user, String outputSchema, AgentListener listener) {
+        String prompt = user;
+        AgentOutputParseException lastError = null;
+        for (int attempt = 0; attempt < MAX_PARSE_RETRIES; attempt++) {
+            LlmRequest llmRequest = new LlmRequest(system, prompt, ResponseFormat.jsonSchema("agent_output", outputSchema));
+            String raw = llm.completeStream(llmRequest, listener::onModelDelta);
+            listener.onModelComplete(raw);
+            try {
+                return parser.parse(raw, outputSchema);
+            } catch (AgentOutputParseException ex) {
+                lastError = ex;
+                listener.onNotice("模型输出不符合 Schema，正在重试(" + (attempt + 1) + "/" + MAX_PARSE_RETRIES + "): " + ex.getMessage());
+                prompt = user + "\n\n上一次输出未通过校验，请严格按 Schema 重新输出。错误信息: " + ex.getMessage();
+            }
+        }
+        throw lastError;
+    }
+
+    private String call(Tool tool, JsonNode input, AgentListener listener) {
+        String toolName = tool.name();
+        String toolInput = input == null ? "{}" : input.toPrettyString();
+
+        // 通知工具开始
+        listener.onToolStart(toolName, toolInput);
+
+        long start = System.nanoTime();
+
+        // 1. 参数校验
+        String validationError = toolInputValidator.validate(tool, input);
+
+        if (validationError != null) {
+            long costMs = (System.nanoTime() - start) / 1_000_000;
+
+            log.warn("工具 {} 参数校验失败: {}", toolName, validationError);
+
+            listener.onToolComplete(
+                    toolName,
+                    false,
+                    validationError,
+                    costMs
+            );
+
+            return validationError;
         }
 
+        // 2. 执行工具
         try {
-            String observation = tool.execute(input);
+            String result = tool.execute(input);
 
-            return observation == null || observation.isBlank()
-                    ? "工具执行成功但没有返回内容"
-                    : observation;
+            if (result == null || result.isBlank()) {
+                result = "工具执行成功，但没有返回内容";
+            }
+
+            long costMs = (System.nanoTime() - start) / 1_000_000;
+
+            log.info("工具 {} 执行完成，耗时 {} ms", toolName, costMs);
+
+            listener.onToolComplete(
+                    toolName,
+                    true,
+                    result,
+                    costMs
+            );
+
+            return result;
 
         } catch (RuntimeException ex) {
-            log.warn("工具 {} 执行异常", tool.name(), ex);
+            long costMs = (System.nanoTime() - start) / 1_000_000;
 
-            return "工具执行失败: "
+            String error = "工具执行失败: "
                     + (ex.getMessage() == null ? ex.toString() : ex.getMessage());
+
+            log.error("工具 {} 执行失败，耗时 {} ms", toolName, costMs, ex);
+
+            listener.onToolComplete(
+                    toolName,
+                    false,
+                    error,
+                    costMs
+            );
+
+            return error;
         }
     }
 
