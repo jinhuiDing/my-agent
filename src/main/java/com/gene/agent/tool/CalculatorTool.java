@@ -25,9 +25,10 @@ public class CalculatorTool implements Tool {
 
         ObjectNode properties = schema.putObject("properties");
 
-        ObjectNode city = properties.putObject("expression");
-        city.put("type", "string");
-        city.put("description", "算数表达式");
+        ObjectNode expression = properties.putObject("expression");
+        expression.put("type", "string");
+        expression.put("minLength", 1);
+        expression.put("description", "仅包含算术表达式，例如 (237 + 45) * 1.13；不要带单位、等号或解释文字");
 
         schema.putArray("required").add("expression");
         schema.put("additionalProperties", false);
@@ -37,17 +38,21 @@ public class CalculatorTool implements Tool {
 
     @Override
     public String description() {
-        return "计算一个算术表达式，输入只要算式本身，不要带单位或解释文字。"
-                + "支持 + - * / % ^ 括号，以及 sqrt/abs/round/floor/ceil/ln/log/exp/sin/cos/tan/pow/min/max 和常量 pi、e。"
-                + "例子: calculator[ (237 + 45) * 1.13 ] 或 calculator[ sqrt(2) ^ 4 ]";
+        return "用于精确算术计算。输入 JSON 对象，必填字段 expression 是仅含算式的字符串，不要带单位、等号或解释文字。"
+                + "支持 + - * / % ^、括号、科学计数法，以及 sqrt/cbrt/abs/round/floor/ceil/ln/log10/log/exp/"
+                + "sin/cos/tan/pow/min/max 和常量 pi、e。"
+                + "log(x) 以 10 为底，log(base,x) 以 base 为底；三角函数使用弧度。"
+                + "例子: {\"expression\":\"(237 + 45) * 1.13\"} 或 {\"expression\":\"sqrt(2) ^ 4\"}";
     }
 
     @Override
     public String execute(JsonNode input) {
-        if (input == null || input.isEmpty()) {
-            return "错误: calculator 需要一个算式，例如 237 + 45 * 2";
+        String expression = input == null
+                ? ""
+                : stripWrappers(input.path("expression").asText("").trim());
+        if (expression.isBlank()) {
+            return "错误: calculator 需要 expression 字段，例如 {\"expression\":\"237 + 45 * 2\"}";
         }
-        String expression = stripWrappers(input.get("expression").asText());
         try {
             double value = ExpressionEvaluator.eval(expression);
             if (Double.isNaN(value) || Double.isInfinite(value)) {
