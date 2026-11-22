@@ -1,5 +1,6 @@
 package com.gene.agent.agent;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.ExecutionException;
@@ -9,12 +10,15 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.gene.agent.config.AgentProperties;
 import com.gene.agent.core.AgentRunTerminationReason;
 import com.gene.agent.exception.AgentOutputParseException;
 import com.gene.agent.llm.LlmRequest;
 import com.gene.agent.llm.ResponseFormat;
+import com.gene.agent.llm.message.*;
 import com.gene.agent.output.*;
 import com.gene.agent.runtime.AgentRunContext;
 import com.gene.agent.llm.LlmClient;
@@ -43,7 +47,9 @@ public class ReactAgent {
 
     private static final Logger log = LoggerFactory.getLogger(ReactAgent.class);
 
-    /** 模型输出不符合 Schema 时的最大重试次数。 */
+    /**
+     * 模型输出不符合 Schema 时的最大重试次数。
+     */
     private static final int MAX_PARSE_RETRIES = 2;
 
     private final LlmClient llm;
@@ -59,10 +65,11 @@ public class ReactAgent {
         thread.setDaemon(true);
         return thread;
     });
+    private final ObjectMapper objectMapper;
 
     public ReactAgent(LlmClient llm, ReActPrompt prompt, AgentOutputParser parser,
                       ToolRegistry tools, AgentProperties properties, ToolInputValidator toolInputValidator,
-                      RunRegistry runRegistry) {
+                      RunRegistry runRegistry, ObjectMapper objectMapper) {
         this.llm = llm;
         this.prompt = prompt;
         this.parser = parser;
@@ -70,6 +77,7 @@ public class ReactAgent {
         this.properties = properties;
         this.toolInputValidator = toolInputValidator;
         this.runRegistry = runRegistry;
+        this.objectMapper = objectMapper;
     }
 
     public AgentRunResult run(String question) {
@@ -87,14 +95,22 @@ public class ReactAgent {
             // 入参合法性由 ToolInputValidator 在运行时校验。
             String outputSchema = AgentOutputSchema.SCHEMA;
 
+            String system = prompt.system();
+            SystemMessage systemMessage = new SystemMessage(system);
+            UserMessage userMessage = new UserMessage(context.getQuestion());
+
+            ArrayList<Message> messages = new ArrayList<>();
+            messages.add(systemMessage);
+            messages.add(userMessage);
+
             // 每轮先检查是否已被外部终止（取消/超时），再决定是否继续推进
             while (!context.isTerminal() && context.getCurrentStep() < context.getMaxSteps()) {
                 int step = context.nextStep();
                 listener.onStepStart(step, context.getMaxSteps());
 
-                String system = prompt.system();
-                String user = prompt.user(context.getQuestion(), context.getHistory(), step);
-                AgentOutput output = askModel(system, user, outputSchema, listener);
+
+//                String user = prompt.user(context.getQuestion(), context.getHistory(), step);
+                AgentOutput output = askModel(messages, outputSchema, listener);
 
                 // 模型生成期间可能被外部终止，此时不再推进状态机，直接收尾
                 if (context.isTerminal()) {
@@ -129,6 +145,7 @@ public class ReactAgent {
                             properties.maxObservationChars()
                     );
                 }
+                messages.add(new ToolMessage(action.name(), observation));
 
                 String actionInput = action.input() == null
                         ? "{}"
@@ -151,7 +168,7 @@ public class ReactAgent {
 
             // 步数用尽：强行让它别再调工具，把已经拿到的信息总结成答案
             listener.onNotice("已达最大步数 " + properties.maxSteps() + "，不再调用工具，用已有信息收尾");
-            String forced = summarizeWithoutTools(question, context.getHistory(), listener);
+            String forced = summarizeWithoutTools(messages, context.getHistory(), listener);
             context.finishByLimit();
             return finish(context, forced, false, listener);
         } catch (RuntimeException ex) {
@@ -208,19 +225,26 @@ public class ReactAgent {
      * 请求模型并解析输出；当输出不符合 Schema 时把校验错误反馈给模型重试，
      * 避免单次格式偏差（如空的 final answer）直接让整次运行崩溃。
      */
-    private AgentOutput askModel(String system, String user, String outputSchema, AgentListener listener) {
-        String prompt = user;
+    private AgentOutput askModel(List<Message> messages, String outputSchema, AgentListener listener) {
+
         AgentOutputParseException lastError = null;
         for (int attempt = 0; attempt < MAX_PARSE_RETRIES; attempt++) {
-            LlmRequest llmRequest = new LlmRequest(system, prompt, ResponseFormat.jsonSchema("agent_output", outputSchema));
+            LlmRequest llmRequest = new LlmRequest(messages, ResponseFormat.jsonSchema("agent_output", outputSchema));
             String raw = llm.completeStream(llmRequest, listener::onModelDelta);
+
+            messages.add(new AssistantMessage(raw));
+
             listener.onModelComplete(raw);
             try {
-                return parser.parse(raw, outputSchema);
+                AgentOutput parse = parser.parse(raw, outputSchema);
+                if (attempt>0) {
+                    messages.subList(attempt, messages.size()).clear();
+                }
+                return parse;
             } catch (AgentOutputParseException ex) {
                 lastError = ex;
                 listener.onNotice("模型输出不符合 Schema，正在重试(" + (attempt + 1) + "/" + MAX_PARSE_RETRIES + "): " + ex.getMessage());
-                prompt = user + "\n\n上一次输出未通过校验，请严格按 Schema 重新输出。错误信息: " + ex.getMessage();
+                messages.add(new UserMessage("上一次输出未通过校验，请严格按 Schema 重新输出。错误信息: " + ex.getMessage()));
             }
         }
         throw lastError;
@@ -289,12 +313,12 @@ public class ReactAgent {
         }
     }
 
-    private String summarizeWithoutTools(String question, List<Step> history, AgentListener listener) {
-        String user = prompt.user(question, history, history.size() + 1)
-                + "\n\n补充要求: 不允许再调用工具，直接输出 Final Answer，基于上面已有信息尽量回答，并指出还缺什么。";
+    private String summarizeWithoutTools(List<Message> messages, List<Step> history, AgentListener listener) {
+
+        messages.add(new UserMessage("补充要求: 不允许再调用工具，直接输出 Final Answer，基于上面已有信息尽量回答，并指出还缺什么。"));
         AgentOutput output;
         try {
-            LlmRequest llmRequest = new LlmRequest(prompt.system(), user, ResponseFormat.jsonSchema("agent_output", AgentOutputSchema.SCHEMA));
+            LlmRequest llmRequest = new LlmRequest(messages, ResponseFormat.jsonSchema("agent_output", AgentOutputSchema.SCHEMA));
 
             output = parser.parse(llm.completeStream(llmRequest, listener::onModelDelta));
         } catch (RuntimeException ex) {

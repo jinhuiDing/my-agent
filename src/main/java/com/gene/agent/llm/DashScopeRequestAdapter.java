@@ -5,6 +5,12 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.gene.agent.llm.message.Message;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
 
 public class DashScopeRequestAdapter {
 
@@ -21,13 +27,11 @@ public class DashScopeRequestAdapter {
 
         ArrayNode messages = body.putArray("messages");
 
-        ObjectNode systemMessage = messages.addObject();
-        systemMessage.put("role", "system");
-        systemMessage.put("content", request.systemPrompt());
-
-        ObjectNode userMessage = messages.addObject();
-        userMessage.put("role", "user");
-        userMessage.put("content", request.userPrompt());
+        for (Message message :  request.messages()) {
+            ObjectNode jsonNodes = messages.addObject();
+            jsonNodes.put("role", message.role().name().toLowerCase(Locale.ROOT));
+            jsonNodes.put("content", message.content());
+        }
 
         appendResponseFormat(body, request.responseFormat());
 
@@ -70,5 +74,21 @@ public class DashScopeRequestAdapter {
                     "JSON Schema 格式不正确", e
             );
         }
+    }
+
+
+    private List<Map<String, String>> convertMessages(
+            List<Message> messages) {
+
+        List<Map<String, String>> result = new ArrayList<>();
+
+        for (Message message : messages) {
+            result.add(Map.of(
+                    "role", message.role().name().toLowerCase(),
+                    "content", message.content()
+            ));
+        }
+
+        return result;
     }
 }
