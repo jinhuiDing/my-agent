@@ -1,19 +1,28 @@
 package com.gene.agent.agent;
 
 import java.util.List;
+import java.util.Locale;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.gene.agent.config.AgentProperties;
+import com.gene.agent.core.AgentRunTerminationReason;
 import com.gene.agent.exception.AgentOutputParseException;
 import com.gene.agent.llm.LlmRequest;
 import com.gene.agent.llm.ResponseFormat;
 import com.gene.agent.output.*;
 import com.gene.agent.runtime.AgentRunContext;
 import com.gene.agent.llm.LlmClient;
-import com.gene.agent.runtime.AgentRunStatus;
+import com.gene.agent.runtime.RunRegistry;
 import com.gene.agent.tool.Tool;
 import com.gene.agent.tool.ToolInputValidator;
 import com.gene.agent.tool.ToolRegistry;
+import jakarta.annotation.PreDestroy;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -43,15 +52,24 @@ public class ReactAgent {
     private final ToolRegistry tools;
     private final AgentProperties properties;
     private final ToolInputValidator toolInputValidator;
+    private final RunRegistry runRegistry;
+    private final ExecutorService toolExecutor = Executors.newCachedThreadPool(runnable -> {
+        Thread thread = new Thread(runnable);
+        thread.setName("agent-tool-" + thread.getId());
+        thread.setDaemon(true);
+        return thread;
+    });
 
     public ReactAgent(LlmClient llm, ReActPrompt prompt, AgentOutputParser parser,
-                      ToolRegistry tools, AgentProperties properties, ToolInputValidator toolInputValidator) {
+                      ToolRegistry tools, AgentProperties properties, ToolInputValidator toolInputValidator,
+                      RunRegistry runRegistry) {
         this.llm = llm;
         this.prompt = prompt;
         this.parser = parser;
         this.tools = tools;
         this.properties = properties;
         this.toolInputValidator = toolInputValidator;
+        this.runRegistry = runRegistry;
     }
 
     public AgentRunResult run(String question) {
@@ -62,9 +80,15 @@ public class ReactAgent {
         AgentRunContext context = new AgentRunContext(question, properties.maxSteps());
         context.start();
         try {
-            listener.onRunStart(question, tools.names(), context.getMaxSteps());
-            String outputSchema = AgentOutputSchema.build(tools.all());
-            while (context.getCurrentStep() < context.getMaxSteps()) {
+            runRegistry.register(context, properties.runTimeout());
+            listener.onRunStart(context.getRunId(), question, tools.names(), context.getMaxSteps());
+            // 通用 Schema：不锁死工具名（name 仅要求非空字符串）。
+            // 工具清单通过 prompt 文本引导模型，未知工具名由下面的 tool == null 分支兜底，
+            // 入参合法性由 ToolInputValidator 在运行时校验。
+            String outputSchema = AgentOutputSchema.SCHEMA;
+
+            // 每轮先检查是否已被外部终止（取消/超时），再决定是否继续推进
+            while (!context.isTerminal() && context.getCurrentStep() < context.getMaxSteps()) {
                 int step = context.nextStep();
                 listener.onStepStart(step, context.getMaxSteps());
 
@@ -72,18 +96,14 @@ public class ReactAgent {
                 String user = prompt.user(context.getQuestion(), context.getHistory(), step);
                 AgentOutput output = askModel(system, user, outputSchema, listener);
 
-                if (output instanceof FinalOutput(String answer)) {
-                    AgentRunResult result = new AgentRunResult(
-                            question,
-                            answer,
-                            context.getHistory(),
-                            true,
-                            "final_answer"
-                    );
+                // 模型生成期间可能被外部终止，此时不再推进状态机，直接收尾
+                if (context.isTerminal()) {
+                    break;
+                }
 
+                if (output instanceof FinalOutput(String answer)) {
                     context.complete();
-                    listener.onDone(result);
-                    return result;
+                    return finish(context, answer, true, listener);
                 }
 
                 ActionOutput actionOutput = (ActionOutput) output;
@@ -105,7 +125,7 @@ public class ReactAgent {
                     listener.onAction(actionName, actionInput);
 
                     observation = truncate(
-                            call(tool, action.input(),listener),
+                            call(tool, action.input(), listener),
                             properties.maxObservationChars()
                     );
                 }
@@ -123,24 +143,65 @@ public class ReactAgent {
 
                 listener.onObservation(observation);
             }
+
+            // 被外部终止（取消/超时）：不再调用工具，用已有信息收尾
+            if (context.isTerminal()) {
+                return finish(context, terminalAnswer(context), false, listener);
+            }
+
             // 步数用尽：强行让它别再调工具，把已经拿到的信息总结成答案
             listener.onNotice("已达最大步数 " + properties.maxSteps() + "，不再调用工具，用已有信息收尾");
             String forced = summarizeWithoutTools(question, context.getHistory(), listener);
-
             context.finishByLimit();
-
-
-            AgentRunResult result = new AgentRunResult(question, forced, context.getHistory(), false, "max_steps_reached");
-            listener.onDone(result);
-            return result;
+            return finish(context, forced, false, listener);
         } catch (RuntimeException ex) {
-            if (context.getStatus() == AgentRunStatus.RUNNING) {
-                context.fail();
+            // 中断可能让模型调用或工具调用抛异常；若外部已设置取消/超时，
+            // 必须保留原终止原因，不能覆盖成 INTERNAL_ERROR。
+            boolean externallyTerminated = context.isTerminal();
+            if (!externallyTerminated) {
+                context.fail(classifyFailure(ex));
             }
-            // todo 如果 listener.onError(ex) 自己也抛异常，那么原始异常 ex 可能被覆盖。
             listener.onError(ex);
-            throw ex;
+            String answer = externallyTerminated ? terminalAnswer(context) : failureAnswer(ex);
+            return finish(context, answer, false, listener);
+        } finally {
+            runRegistry.unregister(context.getRunId());
         }
+    }
+
+    /**
+     * 统一的终止出口：从 context 读取终止原因构造结果，并广播 onDone。
+     * 所有终止路径（成功/步数用尽/取消/超时/失败）都经过这里，保证结果结构一致。
+     */
+    private AgentRunResult finish(AgentRunContext context, String answer, boolean solved, AgentListener listener) {
+        AgentRunResult result = buildResult(context, answer, solved);
+        listener.onDone(result);
+        return result;
+    }
+
+    private AgentRunResult buildResult(AgentRunContext context, String answer, boolean solved) {
+        AgentRunTerminationReason reason = context.getTerminationReason();
+        String stopReason = reason == null ? "unknown" : reason.name().toLowerCase(Locale.ROOT);
+        return new AgentRunResult(context.getRunId(), context.getQuestion(), answer, context.getHistory(), solved, stopReason);
+    }
+
+    private AgentRunTerminationReason classifyFailure(RuntimeException ex) {
+        if (ex instanceof AgentOutputParseException) {
+            return AgentRunTerminationReason.PARSE_ERROR;
+        }
+        return AgentRunTerminationReason.INTERNAL_ERROR;
+    }
+
+    private String terminalAnswer(AgentRunContext context) {
+        return switch (context.getTerminationReason()) {
+            case USER_CANCEL -> "运行已被取消。";
+            case TIMEOUT -> "运行已超时。";
+            default -> "运行已终止：" + context.getTerminationReason();
+        };
+    }
+
+    private String failureAnswer(RuntimeException ex) {
+        return "运行失败：" + (ex.getMessage() == null ? ex.toString() : ex.getMessage());
     }
 
     /**
@@ -192,42 +253,38 @@ public class ReactAgent {
             return validationError;
         }
 
-        // 2. 执行工具
+        // 2. 在独立工作线程执行工具，避免工具超时直接影响运行线程。
+        Future<String> future = toolExecutor.submit(() -> tool.execute(input));
         try {
-            String result = tool.execute(input);
+            String result = future.get(properties.toolTimeout().toMillis(), TimeUnit.MILLISECONDS);
 
             if (result == null || result.isBlank()) {
                 result = "工具执行成功，但没有返回内容";
             }
 
             long costMs = (System.nanoTime() - start) / 1_000_000;
-
             log.info("工具 {} 执行完成，耗时 {} ms", toolName, costMs);
-
-            listener.onToolComplete(
-                    toolName,
-                    true,
-                    result,
-                    costMs
-            );
-
+            listener.onToolComplete(toolName, true, result, costMs);
             return result;
-
-        } catch (RuntimeException ex) {
+        } catch (TimeoutException ex) {
+            future.cancel(true);
             long costMs = (System.nanoTime() - start) / 1_000_000;
-
+            String error = "工具执行超时: 超过 " + properties.toolTimeout().toMillis() + " ms，已中断工具调用";
+            log.warn("工具 {} 执行超时，耗时 {} ms", toolName, costMs);
+            listener.onToolComplete(toolName, false, error, costMs);
+            return error;
+        } catch (InterruptedException ex) {
+            // 用户取消或运行总超时会中断等待线程，同时取消工具工作线程。
+            future.cancel(true);
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("工具执行被中断", ex);
+        } catch (ExecutionException ex) {
+            long costMs = (System.nanoTime() - start) / 1_000_000;
+            Throwable cause = ex.getCause() == null ? ex : ex.getCause();
             String error = "工具执行失败: "
-                    + (ex.getMessage() == null ? ex.toString() : ex.getMessage());
-
-            log.error("工具 {} 执行失败，耗时 {} ms", toolName, costMs, ex);
-
-            listener.onToolComplete(
-                    toolName,
-                    false,
-                    error,
-                    costMs
-            );
-
+                    + (cause.getMessage() == null ? cause.toString() : cause.getMessage());
+            log.error("工具 {} 执行失败，耗时 {} ms", toolName, costMs, cause);
+            listener.onToolComplete(toolName, false, error, costMs);
             return error;
         }
     }
@@ -252,6 +309,11 @@ public class ReactAgent {
         }
         return "步数已用完，没能得到最终答案。最后一步的观察是："
                 + (history.isEmpty() ? "(无)" : history.get(history.size() - 1).observation());
+    }
+
+    @PreDestroy
+    public void shutdown() {
+        toolExecutor.shutdownNow();
     }
 
     private String truncate(String text, int maxChars) {

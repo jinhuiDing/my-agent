@@ -1,5 +1,6 @@
 package com.gene.agent.runtime;
 
+import com.gene.agent.core.AgentRunTerminationReason;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -32,7 +33,7 @@ class AgentRunContextTest {
         AgentRunContext context = new AgentRunContext("test", 5);
 
         context.start();
-        context.fail();
+        context.fail(AgentRunTerminationReason.INTERNAL_ERROR);
 
         assertEquals(AgentRunStatus.FAILED, context.getStatus());
     }

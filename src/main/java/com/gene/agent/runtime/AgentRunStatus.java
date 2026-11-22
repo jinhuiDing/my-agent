@@ -10,5 +10,6 @@ public enum AgentRunStatus {
 
     FAILED,
 
-    MAX_STEPS_REACHED
+    MAX_STEPS_REACHED,
+    CANCELLED
 }

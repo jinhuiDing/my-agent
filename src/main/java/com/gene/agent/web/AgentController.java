@@ -8,6 +8,9 @@ import java.util.Map;
 import com.gene.agent.agent.AgentListener;
 import com.gene.agent.agent.AgentRunResult;
 import com.gene.agent.agent.ReactAgent;
+import com.gene.agent.core.AgentRunTerminationReason;
+import com.gene.agent.runtime.AgentRunContext;
+import com.gene.agent.runtime.RunRegistry;
 import com.gene.agent.tool.ToolRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -18,6 +21,7 @@ import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.server.ResponseStatusException;
@@ -41,16 +45,38 @@ class AgentController {
     private final ReactAgent agent;
     private final ToolRegistry tools;
     private final TaskExecutor executor;
+    private final RunRegistry runRegistry;
 
-    AgentController(ReactAgent agent, ToolRegistry tools, TaskExecutor executor) {
+    AgentController(ReactAgent agent, ToolRegistry tools, TaskExecutor executor, RunRegistry runRegistry) {
         this.agent = agent;
         this.tools = tools;
         this.executor = executor;
+        this.runRegistry = runRegistry;
     }
 
     @GetMapping("/tools")
     List<Map<String, String>> listTools() {
         return tools.names().stream().map(name -> Map.of("name", name)).toList();
+    }
+
+    @GetMapping("/agent/runs")
+    List<RunSnapshot> listRuns() {
+        return runRegistry.running().stream().map(AgentController::toRunSnapshot).toList();
+    }
+
+    @GetMapping("/agent/runs/{runId}")
+    RunSnapshot getRun(@PathVariable String runId) {
+        RunRegistry.RunningRun run = runRegistry.find(runId)
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "运行不存在或已结束"));
+        return toRunSnapshot(run);
+    }
+
+    @PostMapping("/agent/runs/{runId}/cancel")
+    Map<String, Object> cancelRun(@PathVariable String runId) {
+        if (!runRegistry.abort(runId, AgentRunTerminationReason.USER_CANCEL)) {
+            throw new ResponseStatusException(HttpStatus.NOT_FOUND, "运行不存在或已结束");
+        }
+        return Map.of("runId", runId, "cancelRequested", true);
     }
 
     @PostMapping("/agent/ask")
@@ -65,9 +91,13 @@ class AgentController {
         String question = questionOf(request);
         // 0 = 不设超时，agent 可能跑好几分钟
         SseEmitter emitter = new SseEmitter(0L);
+        SseAgentListener listener = new SseAgentListener(emitter, runRegistry);
+        emitter.onCompletion(listener::cancel);
+        emitter.onTimeout(listener::cancel);
+        emitter.onError(ignored -> listener.cancel());
         executor.execute(() -> {
             try {
-                agent.run(question, new SseAgentListener(emitter));
+                agent.run(question, listener);
             } catch (RuntimeException ex) {
                 log.error("流式 agent 运行失败: {}", question, ex);
                 sendQuietly(emitter, "error",
@@ -89,12 +119,29 @@ class AgentController {
 
     private static Map<String, Object> toResponse(AgentRunResult result) {
         return Map.of(
+                "runId", result.runId(),
                 "question", result.question(),
                 "solved", result.solved(),
                 "stopReason", result.stopReason(),
                 "answer", result.answer() == null ? "" : result.answer(),
                 "steps", result.steps(),
                 "trace", result.describeTrace());
+    }
+
+    private static RunSnapshot toRunSnapshot(RunRegistry.RunningRun run) {
+        AgentRunContext context = run.context();
+        String terminationReason = context.getTerminationReason() == null
+                ? null
+                : context.getTerminationReason().name();
+        return new RunSnapshot(
+                context.getRunId(),
+                context.getQuestion(),
+                context.getStatus().name(),
+                context.getCurrentStep(),
+                context.getMaxSteps(),
+                context.getDurationMs(),
+                terminationReason
+        );
     }
 
     private static void sendQuietly(SseEmitter emitter, String name, Object data) {
@@ -113,12 +160,32 @@ class AgentController {
     record AskRequest(String question) {
     }
 
-    /** 把 agent 事件转成 SSE；客户端断开时 send 抛异常，直接中止本次运行。 */
-    private record SseAgentListener(SseEmitter emitter) implements AgentListener {
+    record RunSnapshot(String runId, String question, String status, int currentStep,
+                       int maxSteps, long durationMs, String terminationReason) {
+    }
+
+    /** 把 agent 事件转成 SSE；客户端断开时统一走 RunRegistry 的取消路径。 */
+    private static final class SseAgentListener implements AgentListener {
+
+        private final SseEmitter emitter;
+        private final RunRegistry runRegistry;
+        private volatile String runId;
+        private volatile boolean disconnected;
+
+        private SseAgentListener(SseEmitter emitter, RunRegistry runRegistry) {
+            this.emitter = emitter;
+            this.runRegistry = runRegistry;
+        }
 
         @Override
-        public void onRunStart(String question, List<String> tools, int maxSteps) {
-            send("start", Map.of("question", question, "tools", tools, "maxSteps", maxSteps));
+        public void onRunStart(String runId, String question, List<String> tools, int maxSteps) {
+            this.runId = runId;
+            if (disconnected) {
+                // SSE 可能在线程真正启动前就断开，此时拿到 runId 后仍需补发取消。
+                cancel();
+                return;
+            }
+            send("start", Map.of("runId", runId, "question", question, "tools", tools, "maxSteps", maxSteps));
         }
 
         @Override
@@ -163,6 +230,7 @@ class AgentController {
         @Override
         public void onDone(AgentRunResult result) {
             send("done", Map.of(
+                    "runId", result.runId(),
                     "solved", result.solved(),
                     "stopReason", result.stopReason(),
                     "answer", result.answer() == null ? "" : result.answer(),
@@ -170,11 +238,26 @@ class AgentController {
                     "trace", result.describeTrace()));
         }
 
+        private void cancel() {
+            disconnected = true;
+            String currentRunId = runId;
+            if (currentRunId != null) {
+                runRegistry.abort(currentRunId, AgentRunTerminationReason.USER_CANCEL);
+            }
+        }
+
         private void send(String name, Object data) {
+            if (disconnected) {
+                return;
+            }
             try {
                 emitter.send(SseEmitter.event().name(name).data(data));
             } catch (IOException ex) {
+                cancel();
                 throw new UncheckedIOException(ex);
+            } catch (IllegalStateException ex) {
+                cancel();
+                throw ex;
             }
         }
     }

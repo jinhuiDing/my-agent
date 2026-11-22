@@ -2,7 +2,7 @@ package com.gene.agent.agent;
 
 import java.util.List;
 
-public record AgentRunResult(String question, String answer, List<Step> steps, boolean solved, String stopReason) {
+public record AgentRunResult(String runId, String question, String answer, List<Step> steps, boolean solved, String stopReason) {
 
     /** 把每一轮的过程打出来，学习时最需要看这个。 */
     public String describeTrace() {

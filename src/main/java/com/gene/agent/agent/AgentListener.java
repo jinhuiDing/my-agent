@@ -8,7 +8,7 @@ import java.util.List;
  */
 public interface AgentListener {
 
-    default void onRunStart(String question, List<String> tools, int maxSteps) {
+    default void onRunStart(String runId, String question, List<String> tools, int maxSteps) {
     }
 
     default void onStepStart(int step, int maxSteps) {

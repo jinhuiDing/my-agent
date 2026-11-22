@@ -16,6 +16,10 @@ agent:
   max-observation-chars: 1200
   connect-timeout: 10s
   read-timeout: 90s
+  # 单次工具执行预算；超时只形成失败 Observation，不直接终止整次运行
+  tool-timeout: 10s
+  # 整次运行的总预算，覆盖所有模型轮次和工具调用；超时后中断运行线程
+  run-timeout: 5m
   # 关掉控制台交互，只保留网页和 HTTP 入口（POST /api/agent/ask）
   cli-enabled: false
 

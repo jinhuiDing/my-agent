@@ -62,9 +62,9 @@ public class SearchTool implements Tool {
 
         ObjectNode properties = schema.putObject("properties");
 
-        ObjectNode city = properties.putObject("city");
-        city.put("type", "string");
-        city.put("description", "城市名称");
+        ObjectNode query = properties.putObject("query");
+        query.put("type", "string");
+        query.put("description", "搜索关键字");
 
         schema.putArray("required").add("city");
         schema.put("additionalProperties", false);

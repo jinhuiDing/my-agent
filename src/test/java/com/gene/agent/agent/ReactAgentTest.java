@@ -7,17 +7,26 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.gene.agent.config.AgentProperties;
+import com.gene.agent.core.AgentRunTerminationReason;
 import com.gene.agent.llm.LlmClient;
 import com.gene.agent.llm.LlmRequest;
 import com.gene.agent.output.AgentOutputParser;
+import com.gene.agent.runtime.RunRegistry;
 import com.gene.agent.tool.Tool;
+import com.gene.agent.tool.ToolInputValidator;
 import com.gene.agent.tool.ToolRegistry;
 
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
@@ -29,6 +38,12 @@ class ReactAgentTest {
     private ReactAgent agent;
     private Tool tool;
     private ObjectNode toolInput;
+    private RunRegistry runRegistry;
+    private ToolRegistry tools;
+    private ReActPrompt prompt;
+    private AgentOutputParser parser;
+    private ToolInputValidator toolInputValidator;
+
     @BeforeEach
     void setUp() {
         // Mock 外部依赖
@@ -39,17 +54,26 @@ class ReactAgentTest {
 
         when(tool.name()).thenReturn("test_tool");
         when(tool.description()).thenReturn("测试工具");
+        when(tool.inputSchema()).thenReturn(
+                new ObjectMapper().createObjectNode().put("type", "object")
+        );
         when(tool.execute(any(JsonNode.class))).thenReturn("工具执行结果");
 
         // 这里使用包含 mockTool 的注册表
-        ToolRegistry tools = new ToolRegistry(List.of(tool));
-
-
-
-        ReActPrompt prompt = new ReActPrompt(tools);
-        AgentOutputParser parser = new AgentOutputParser(new ObjectMapper());
+        tools = new ToolRegistry(List.of(tool));
+        prompt = new ReActPrompt(tools);
+        parser = new AgentOutputParser(new ObjectMapper());
         toolInput = new ObjectMapper().createObjectNode().put("param", "测试参数");
+        toolInputValidator = mock(ToolInputValidator.class);
+        runRegistry = new RunRegistry();
+        agent = createAgent(Duration.ofSeconds(30));
+    }
 
+    private ReactAgent createAgent(Duration runTimeout) {
+        return createAgent(runTimeout, Duration.ofSeconds(5));
+    }
+
+    private ReactAgent createAgent(Duration runTimeout, Duration toolTimeout) {
         AgentProperties properties = new AgentProperties(
                 "http://localhost",
                 "test-api-key",
@@ -59,16 +83,25 @@ class ReactAgentTest {
                 1000,
                 Duration.ofSeconds(5),
                 Duration.ofSeconds(30),
+                toolTimeout,
+                runTimeout,
                 false
         );
-
-        agent = new ReactAgent(
+        return new ReactAgent(
                 llm,
                 prompt,
                 parser,
                 tools,
-                properties
+                properties,
+                toolInputValidator,
+                runRegistry
         );
+    }
+
+    @AfterEach
+    void tearDown() {
+        agent.shutdown();
+        runRegistry.shutdown();
     }
 
     @Test
@@ -105,7 +138,7 @@ class ReactAgentTest {
                 .completeStream(any(LlmRequest.class), any());
 
         // 验证生命周期事件
-        verify(listener).onRunStart(question, List.of("test_tool"), 3);
+        verify(listener).onRunStart(result.runId(), question, List.of("test_tool"), 3);
         verify(listener).onModelComplete(modelResponse);
         verify(listener).onDone(result);
 
@@ -169,7 +202,8 @@ class ReactAgentTest {
 
     @Test
     void shouldHandleUnknownToolAndContinue() {
-        // Arrange
+        // 通用 Schema 不锁工具名，未注册工具能进入 tool == null 兜底分支，
+        // 形成一条执行历史，observation 为"未找到工具"，模型据此纠正后给出最终答案。
         String question = "帮我查询数据";
 
         String actionResponse = """
@@ -184,39 +218,131 @@ class ReactAgentTest {
                 .thenReturn(actionResponse)
                 .thenReturn(finalResponse);
 
-        // Act
         AgentRunResult result = agent.run(question, listener);
 
-        // Assert
         assertNotNull(result);
         assertEquals("当前无法查询该数据。", result.answer());
         assertTrue(result.solved());
         assertEquals("final_answer", result.stopReason());
 
-        // 未知工具也应该形成一条执行历史
+        // 未知工具形成一条执行历史
         assertEquals(1, result.steps().size());
 
         Step step = result.steps().get(0);
         assertEquals("unknown_tool", step.action());
         assertEquals(toolInput.toPrettyString(), step.actionInput());
+        assertEquals("未找到工具：unknown_tool", step.observation());
 
-        // 未知工具只发 onNotice，没有执行结果，observation 为 null
-        assertNull(step.observation());
+        // 两次模型调用：第一次选未知工具，第二次给出最终答案
+        verify(llm, times(2)).completeStream(any(), any());
 
-        // LLM 第二次调用成功给出答案
-        verify(llm, times(2))
-                .completeStream(any(), any());
-
-        // 不应该执行任何实际工具
+        // 未真正执行任何工具
         verify(tool, never()).execute(any(JsonNode.class));
 
-        // 应该通知监听器
+        // 兜底分支：先 onNotice，再把"未找到工具"写入 observation
         verify(listener).onNotice(contains("unknown_tool"));
-        verify(listener).onObservation(isNull());
+        verify(listener).onObservation("未找到工具：unknown_tool");
         verify(listener).onDone(result);
-
-        // 未知工具不是 Runtime 异常
         verify(listener, never()).onError(any());
+    }
+
+    @Test
+    void shouldInterruptToolAndReturnTimeoutObservation() throws Exception {
+        ReactAgent toolTimeoutAgent = createAgent(Duration.ofSeconds(30), Duration.ofMillis(100));
+        CountDownLatch toolInterrupted = new CountDownLatch(1);
+        when(tool.execute(any(JsonNode.class))).thenAnswer(invocation -> {
+            try {
+                Thread.sleep(10_000);
+            } catch (InterruptedException ex) {
+                toolInterrupted.countDown();
+                Thread.currentThread().interrupt();
+                throw new RuntimeException("工具调用被中断", ex);
+            }
+            return "不应返回";
+        });
+        when(llm.completeStream(any(), any()))
+                .thenReturn("{\"type\":\"action\",\"thought\":\"调用工具\",\"action\":{\"name\":\"test_tool\",\"input\":{\"param\":\"测试参数\"}}}")
+                .thenReturn("{\"type\":\"final\",\"answer\":\"工具超时后改用已有信息回答。\"}");
+
+        try {
+            AgentRunResult result = toolTimeoutAgent.run("测试工具超时", listener);
+
+            assertTrue(result.solved());
+            assertEquals("final_answer", result.stopReason());
+            assertEquals("工具超时后改用已有信息回答。", result.answer());
+            assertEquals(1, result.steps().size());
+            assertTrue(result.steps().get(0).observation().contains("工具执行超时"));
+            assertTrue(toolInterrupted.await(2, TimeUnit.SECONDS));
+            verify(listener).onToolComplete(eq("test_tool"), eq(false), contains("工具执行超时"), anyLong());
+            verify(llm, times(2)).completeStream(any(), any());
+        } finally {
+            toolTimeoutAgent.shutdown();
+        }
+    }
+
+    @Test
+    void shouldInterruptModelCallWhenUserCancels() throws Exception {
+        CountDownLatch modelStarted = new CountDownLatch(1);
+        when(llm.completeStream(any(), any())).thenAnswer(invocation -> {
+            modelStarted.countDown();
+            try {
+                Thread.sleep(10_000);
+            } catch (InterruptedException ex) {
+                Thread.currentThread().interrupt();
+                throw new RuntimeException("模型调用被中断", ex);
+            }
+            return "{\"type\":\"final\",\"answer\":\"不应返回\"}";
+        });
+
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try {
+            Future<AgentRunResult> future = executor.submit(() -> agent.run("长期运行的任务", listener));
+            assertTrue(modelStarted.await(2, TimeUnit.SECONDS));
+            assertEquals(1, runRegistry.running().size());
+
+            String runId = runRegistry.running().get(0).context().getRunId();
+            assertTrue(runRegistry.abort(runId, AgentRunTerminationReason.USER_CANCEL));
+
+            AgentRunResult result = future.get(3, TimeUnit.SECONDS);
+            assertEquals(runId, result.runId());
+            assertFalse(result.solved());
+            assertEquals("user_cancel", result.stopReason());
+            assertEquals("运行已被取消。", result.answer());
+            assertTrue(runRegistry.find(runId).isEmpty());
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
+    @Test
+    void shouldInterruptModelCallWhenRunTimesOut() throws Exception {
+        ReactAgent timeoutAgent = createAgent(Duration.ofMillis(100));
+        CountDownLatch modelStarted = new CountDownLatch(1);
+        when(llm.completeStream(any(), any())).thenAnswer(invocation -> {
+            modelStarted.countDown();
+            try {
+                Thread.sleep(10_000);
+            } catch (InterruptedException ex) {
+                Thread.currentThread().interrupt();
+                throw new RuntimeException("模型调用被中断", ex);
+            }
+            return "{\"type\":\"final\",\"answer\":\"不应返回\"}";
+        });
+
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try {
+            Future<AgentRunResult> future = executor.submit(() -> timeoutAgent.run("会超时的任务", listener));
+            assertTrue(modelStarted.await(2, TimeUnit.SECONDS));
+
+            AgentRunResult result = future.get(3, TimeUnit.SECONDS);
+            assertNotNull(result.runId());
+            assertFalse(result.solved());
+            assertEquals("timeout", result.stopReason());
+            assertEquals("运行已超时。", result.answer());
+            assertTrue(runRegistry.find(result.runId()).isEmpty());
+        } finally {
+            executor.shutdownNow();
+        }
     }
 
 }

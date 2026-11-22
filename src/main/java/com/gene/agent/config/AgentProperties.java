@@ -17,5 +17,7 @@ public record AgentProperties(
         int maxObservationChars,
         Duration connectTimeout,
         Duration readTimeout,
+        Duration toolTimeout,
+        Duration runTimeout,
         boolean cliEnabled) {
 }

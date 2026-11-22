@@ -13,11 +13,12 @@ class LoggingAgentListener implements AgentListener {
     private static final Logger log = LoggerFactory.getLogger(LoggingAgentListener.class);
 
     @Override
-    public void onRunStart(String question, List<String> tools, int maxSteps) {
+    public void onRunStart(String runId, String question, List<String> tools, int maxSteps) {
         log.info("""
                 ============== 新任务 ==============
+                运行: {}
                 问题: {}
-                工具: {}""", question.trim(), tools);
+                工具: {}""", runId, question.trim(), tools);
     }
 
     @Override
