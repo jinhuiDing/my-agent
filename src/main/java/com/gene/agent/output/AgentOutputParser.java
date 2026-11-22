@@ -15,32 +15,34 @@ import java.util.stream.Collectors;
 @Component
 public class AgentOutputParser {
 
-    private final ObjectMapper objectMapper;
+    private static final JsonSchemaFactory SCHEMA_FACTORY =
+            JsonSchemaFactory.getInstance(
+                    SpecVersion.VersionFlag.V202012
+            );
 
-    private final JsonSchema schema;
+    private final ObjectMapper objectMapper;
 
     public AgentOutputParser(ObjectMapper objectMapper) {
         this.objectMapper = objectMapper;
-
-        try {
-            JsonNode schemaNode =
-                    objectMapper.readTree(AgentOutputSchema.SCHEMA);
-
-            JsonSchemaFactory factory =
-                    JsonSchemaFactory.getInstance(
-                            SpecVersion.VersionFlag.V202012
-                    );
-
-            this.schema = factory.getSchema(schemaNode);
-
-        } catch (JsonProcessingException e) {
-            throw new IllegalStateException("Agent 输出 Schema 初始化失败", e);
-        }
     }
 
+    /**
+     * 兼容旧调用：使用默认 Schema 解析。
+     */
     public AgentOutput parse(String raw) {
+        return parse(raw, AgentOutputSchema.SCHEMA);
+    }
+
+    /**
+     * 使用指定 Schema 解析模型输出。
+     */
+    public AgentOutput parse(String raw, String schemaJson) {
         if (raw == null || raw.isBlank()) {
             throw new AgentOutputParseException("模型输出不能为空");
+        }
+
+        if (schemaJson == null || schemaJson.isBlank()) {
+            throw new AgentOutputParseException("Agent 输出 Schema 不能为空");
         }
 
         JsonNode root;
@@ -50,7 +52,15 @@ public class AgentOutputParser {
             throw new AgentOutputParseException("模型输出不是合法 JSON", e);
         }
 
-        // 第一层：JSON Schema 校验
+        // 第一层：解析并校验 JSON Schema
+        JsonSchema schema;
+        try {
+            JsonNode schemaNode = objectMapper.readTree(schemaJson);
+            schema = SCHEMA_FACTORY.getSchema(schemaNode);
+        } catch (JsonProcessingException | RuntimeException e) {
+            throw new AgentOutputParseException("Agent 输出 Schema 无效", e);
+        }
+
         Set<ValidationMessage> errors = schema.validate(root);
 
         if (!errors.isEmpty()) {
@@ -70,7 +80,7 @@ public class AgentOutputParser {
 
             return switch (type) {
                 case "action" -> new ActionOutput(
-                        root.has("thought")
+                        root.hasNonNull("thought")
                                 ? root.get("thought").asText()
                                 : null,
                         objectMapper.treeToValue(
@@ -92,6 +102,5 @@ public class AgentOutputParser {
             throw new AgentOutputParseException("模型输出对象转换失败", e);
         }
     }
-
-
 }
+

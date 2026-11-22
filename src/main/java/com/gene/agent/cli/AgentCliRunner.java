@@ -124,6 +124,18 @@ class AgentCliRunner implements ApplicationRunner {
         }
 
         @Override
+        public void onToolStart(String tool, String input) {
+            out.printf("[工具开始] %s 参数: %s%n", tool, input);
+            out.flush();
+        }
+
+        @Override
+        public void onToolComplete(String tool, boolean success, String result, long costMs) {
+            out.printf("[工具完成] %s %s，耗时 %d ms: %s%n", tool, success ? "成功" : "失败", costMs, result);
+            out.flush();
+        }
+
+        @Override
         public void onObservation(String observation) {
             out.printf("[结果] %s%n", observation);
             out.flush();

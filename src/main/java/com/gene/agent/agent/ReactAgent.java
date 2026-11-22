@@ -57,19 +57,19 @@ public class ReactAgent {
         context.start();
         try {
             listener.onRunStart(question, tools.names(), context.getMaxSteps());
-
+            String outputSchema = AgentOutputSchema.build(tools.all());
             while (context.getCurrentStep() < context.getMaxSteps()) {
                 int step = context.nextStep();
                 listener.onStepStart(step, context.getMaxSteps());
 
                 String system = prompt.system();
                 String user = prompt.user(context.getQuestion(), context.getHistory(), step);
-                LlmRequest llmRequest = new LlmRequest(system, user, ResponseFormat.jsonSchema("agent_output", AgentOutputSchema.build(tools.all())));
+                LlmRequest llmRequest = new LlmRequest(system, user, ResponseFormat.jsonSchema("agent_output", outputSchema));
                 String raw = llm.completeStream(llmRequest, listener::onModelDelta);
 
                 listener.onModelComplete(raw);
 
-                AgentOutput output = parser.parse(raw);
+                AgentOutput output = parser.parse(raw,outputSchema);
 
                 if (output instanceof FinalOutput(String answer)) {
                     AgentRunResult result = new AgentRunResult(

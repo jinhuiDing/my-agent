@@ -29,7 +29,7 @@ import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
  * 一次性返回：
  * curl -X POST localhost:8080/api/agent/ask -H "Content-Type: application/json" -d "{\"question\":\"美元兑人民币汇率乘以1.13等于多少\"}"
  *
- * 流式返回（SSE，事件: start / step / delta / action / observation / notice / done / error）：
+ * 流式返回（SSE，事件: start / step / delta / action / tool_start / tool_complete / observation / notice / done / error）：
  * curl -N -X POST localhost:8080/api/agent/ask/stream -H "Content-Type: application/json" -d "{\"question\":\"...\"}"
  */
 @RestController
@@ -134,6 +134,20 @@ class AgentController {
         @Override
         public void onAction(String tool, String input) {
             send("action", Map.of("tool", tool, "input", input == null ? "" : input));
+        }
+
+        @Override
+        public void onToolStart(String tool, String input) {
+            send("tool_start", Map.of("tool", tool, "input", input == null ? "" : input));
+        }
+
+        @Override
+        public void onToolComplete(String tool, boolean success, String result, long costMs) {
+            send("tool_complete", Map.of(
+                    "tool", tool,
+                    "success", success,
+                    "result", result == null ? "" : result,
+                    "costMs", costMs));
         }
 
         @Override

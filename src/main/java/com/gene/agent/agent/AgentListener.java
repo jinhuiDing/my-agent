@@ -25,7 +25,25 @@ public interface AgentListener {
     /** 解析出的工具即将执行。 */
     default void onAction(String tool, String input) {
     }
+    /** 工具真正开始执行。 */
+    default void onToolStart(String tool, String input) {
+    }
 
+    /**
+     * 工具执行完成。
+     *
+     * @param tool 工具名称
+     * @param success 是否执行成功
+     * @param result 工具返回内容或错误信息
+     * @param costMs 执行耗时（毫秒）
+     */
+    default void onToolComplete(
+            String tool,
+            boolean success,
+            String result,
+            long costMs
+    ) {
+    }
     /** 工具执行结果（或错误提示）。 */
     default void onObservation(String observation) {
     }
