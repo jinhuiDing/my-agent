@@ -228,22 +228,40 @@
     scrollDown();
   }
 
-  async function loadPendingApprovals(runId) {
-    try {
-      const res = await fetch('/api/approvals');
-      if (!res.ok) throw new Error('HTTP ' + res.status);
-      const approvals = await res.json();
-      approvals
-        .filter(item => item.runId === runId && item.status === 'PENDING')
-        .forEach(item => showApproval({
-          runId: item.runId,
-          approvalId: item.approvalId,
-          tool: item.toolName,
-          input: item.toolInput == null ? '{}' : JSON.stringify(item.toolInput, null, 2),
-          reason: item.reason
-        }));
-    } catch (err) {
-      addBlock(traceEl, 'error', '审批单加载失败', err.message || String(err));
+  function onApprovalDone(response) {
+    const entry = approvalCards.get(response.approval.approvalId);
+    const approved = response.approval.status === 'APPROVED';
+    if (entry) {
+      if (!approved) {
+        entry.status.textContent = '已拒绝，工具未执行';
+      } else if (!response.toolExecuted) {
+        entry.status.textContent = '已批准，但工具未执行';
+      } else if (response.toolSuccess === true) {
+        entry.status.textContent = '已批准，工具执行成功';
+      } else if (response.toolSuccess === false) {
+        entry.status.textContent = '已批准，工具执行失败';
+      } else {
+        entry.status.textContent = '已批准，工具已启动但未获得执行结果';
+      }
+
+      if (response.toolResult) {
+        addBlock(
+          entry.card,
+          response.toolSuccess === false ? 'error' : 'observation',
+          '本次工具执行结果',
+          response.toolResult
+        );
+      }
+    }
+
+    const result = response.result;
+    if (result.stopReason === 'waiting_approval') {
+      setStatus('等待人工审批', 'run');
+    } else {
+      onDone({
+        ...result,
+        stepCount: Array.isArray(result.steps) ? result.steps.length : 0
+      });
     }
   }
 
@@ -253,31 +271,42 @@
     entry.approveBtn.disabled = true;
     entry.rejectBtn.disabled = true;
     entry.status.textContent = '正在提交审批…';
+    running = true;
+    gotDone = false;
+    stepCard = null;
+    sendBtn.disabled = true;
+    stopBtn.hidden = false;
+    setStatus('提交审批…', 'run');
+    controller = new AbortController();
 
     try {
-      const res = await fetch('/api/approvals/' + encodeURIComponent(approvalId) + '/' + decision, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ reviewer: 'web', comment: '' })
-      });
-      const result = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(result.error || result.message || ('HTTP ' + res.status));
-
-      entry.status.textContent = decision === 'approve' ? '已批准，运行已继续' : '已拒绝，运行已继续';
-      if (result.stopReason === 'waiting_approval') {
-        setStatus('等待人工审批', 'run');
-        await loadPendingApprovals(result.runId);
-      } else {
-        onDone({
-          ...result,
-          stepCount: Array.isArray(result.steps) ? result.steps.length : 0
-        });
+      const res = await fetch(
+        '/api/approvals/' + encodeURIComponent(approvalId) + '/' + decision + '/stream',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ reviewer: 'web', comment: '' }),
+          signal: controller.signal
+        }
+      );
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.error || body.message || ('HTTP ' + res.status));
       }
+      await readEventStream(res);
     } catch (err) {
-      entry.status.textContent = '审批提交失败';
-      entry.approveBtn.disabled = false;
-      entry.rejectBtn.disabled = false;
-      addBlock(entry.card, 'error', '审批失败', err.message || String(err));
+      if (controller && controller.signal.aborted) {
+        entry.status.textContent = '连接已停止';
+        setStatus('已停止', '');
+      } else {
+        entry.status.textContent = '审批连接失败';
+        entry.approveBtn.disabled = false;
+        entry.rejectBtn.disabled = false;
+        addBlock(entry.card, 'error', '审批失败', err.message || String(err));
+        setStatus('出错', 'err');
+      }
+    } finally {
+      finish();
     }
   }
 
@@ -285,6 +314,9 @@
     switch (name) {
       case 'start':
         setStatus('运行中 · 最多 ' + data.maxSteps + ' 步', 'run');
+        break;
+      case 'resume_start':
+        setStatus('审批已提交，继续运行…', 'run');
         break;
       case 'step':
         newStep(data.step, data.maxSteps);
@@ -294,6 +326,12 @@
         break;
       case 'action':
         if (stepCard) addBlock(stepCard.card, 'tool', '工具调用 · ' + data.tool, data.input || '(无参数)');
+        break;
+      case 'tool_start':
+        setStatus('正在执行工具 · ' + data.tool, 'run');
+        break;
+      case 'tool_complete':
+        setStatus(data.success ? '工具执行成功' : '工具执行失败', data.success ? 'run' : 'err');
         break;
       case 'observation':
         addBlock(stepCard ? stepCard.card : traceEl, 'observation', '工具结果', data.text);
@@ -306,6 +344,9 @@
         break;
       case 'done':
         onDone(data);
+        break;
+      case 'approval_done':
+        onApprovalDone(data);
         break;
       case 'error':
         addBlock(traceEl, 'error', '错误', data.message);
@@ -325,6 +366,23 @@
     let data;
     try { data = JSON.parse(dataLines.join('\n')); } catch (_) { return; }
     handleEvent(event, data);
+  }
+
+  async function readEventStream(res) {
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
+      let index;
+      while ((index = buffer.indexOf('\n\n')) >= 0) {
+        handleFrame(buffer.slice(0, index));
+        buffer = buffer.slice(index + 2);
+      }
+    }
+    if (buffer.trim()) handleFrame(buffer);
   }
 
   function finish() {
@@ -363,20 +421,7 @@
         } catch (_) { /* 非 JSON 错误体 */ }
         throw new Error(message);
       }
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
-        let index;
-        while ((index = buffer.indexOf('\n\n')) >= 0) {
-          handleFrame(buffer.slice(0, index));
-          buffer = buffer.slice(index + 2);
-        }
-      }
-      if (buffer.trim()) handleFrame(buffer);
+      await readEventStream(res);
       if (!gotDone && statusKind === 'run') setStatus('已结束', '');
     } catch (err) {
       if (controller && controller.signal.aborted) {

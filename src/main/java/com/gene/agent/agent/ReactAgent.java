@@ -249,9 +249,6 @@ public class ReactAgent {
         String toolName = tool.name();
         String toolInput = input == null ? "{}" : input.toPrettyString();
 
-        // 通知工具开始
-        listener.onToolStart(toolName, toolInput);
-
         long start = System.nanoTime();
 
         // 1. 参数校验
@@ -291,6 +288,8 @@ public class ReactAgent {
     @NonNull
     private ToolExecutionResult invokeTool(Tool tool, JsonNode input, AgentListener listener, long start) {
         String toolName = tool.name();
+        String toolInput = input == null ? "{}" : input.toPrettyString();
+        listener.onToolStart(toolName, toolInput);
         // 2. 在独立工作线程执行工具，避免工具超时直接影响运行线程。
         Future<String> future = toolExecutor.submit(() -> tool.execute(input));
         try {
