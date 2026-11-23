@@ -1,6 +1,7 @@
 package com.gene.agent.runtime;
 
 import com.gene.agent.core.AgentRunTerminationReason;
+import com.gene.agent.llm.message.Message;
 
 import java.time.Instant;
 import java.util.ArrayList;
@@ -24,6 +25,10 @@ public class AgentRunContext {
     private long startNanos;
 
     private long finishNanos;
+
+    private String pendingApprovalId;
+
+
     public AgentRunContext(String question, int maxSteps) {
         this(UUID.randomUUID().toString().replace("-", "").substring(0, 12), question, maxSteps);
     }
@@ -33,7 +38,23 @@ public class AgentRunContext {
         this.question = question;
         this.maxSteps = maxSteps;
     }
+    public void waitForApproval(String approvalId) {
+        if (status != AgentRunStatus.RUNNING) {
+            throw new IllegalStateException(
+                    "Agent Run cannot complete from status: " + status
+            );
+        }
+        this.pendingApprovalId = approvalId;
+        this.status = AgentRunStatus.WAITING_APPROVAL;
+    }
 
+    public String getPendingApprovalId() {
+        return pendingApprovalId;
+    }
+
+    public void clearPendingApproval() {
+        this.pendingApprovalId = null;
+    }
     public String getRunId() {
         return runId;
     }
@@ -164,5 +185,35 @@ public class AgentRunContext {
                 : finishNanos;
 
         return (end - startNanos) / 1_000_000;
+    }
+
+
+
+
+
+    private final List<Message> messages = new ArrayList<>();
+    private PendingToolCall pendingToolCall;
+
+    public List<Message> getMessages() { return messages; }
+
+    public PendingToolCall getPendingToolCall() { return pendingToolCall; }
+
+    public void clearPendingToolCall() { this.pendingToolCall = null; }
+
+    public void waitForApproval(String approvalId, PendingToolCall call) {
+        if (status != AgentRunStatus.RUNNING) {
+            throw new IllegalStateException("Agent Run cannot wait for approval from status: " + status);
+        }
+        this.pendingApprovalId = approvalId;
+        this.pendingToolCall = call;
+        this.status = AgentRunStatus.WAITING_APPROVAL;
+    }
+
+    public synchronized void resumeFromApproval() {
+        if (status != AgentRunStatus.WAITING_APPROVAL) {
+            throw new IllegalStateException("Agent Run cannot resume from status: " + status);
+        }
+        this.status = AgentRunStatus.RUNNING;
+        this.pendingApprovalId = null;
     }
 }

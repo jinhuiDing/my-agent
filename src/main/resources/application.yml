@@ -23,6 +23,10 @@ agent:
   # 关掉控制台交互，只保留网页和 HTTP 入口（POST /api/agent/ask）
   cli-enabled: false
 
+
+  approval-required-tools: calculator
+
+
 logging:
   level:
     com.gene.agent: debug
