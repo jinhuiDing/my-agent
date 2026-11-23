@@ -1,11 +1,15 @@
 package com.gene.agent.llm;
 
+import com.gene.agent.llm.message.SystemMessage;
+import com.gene.agent.llm.message.UserMessage;
 import com.gene.agent.output.AgentOutputSchema;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.test.context.junit.jupiter.SpringExtension;
+
+import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
 @SpringBootTest
@@ -16,8 +20,10 @@ class OpenAiCompatibleLlmClientTest {
     @Test
     void aaa(){
         LlmRequest request = new LlmRequest(
-                "You are an AI assistant. If you need to perform an action, return an action output. Otherwise, return a final output.",
-                "查询北京今天的天气。",
+                List.of(
+                        new SystemMessage("You are an AI assistant. If you need to perform an action, return an action output. Otherwise, return a final output."),
+                        new UserMessage("查询北京今天的天气。")
+                ),
                 ResponseFormat.jsonSchema(
                         "agent_output",
                         AgentOutputSchema.SCHEMA

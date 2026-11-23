@@ -1,5 +1,7 @@
 package com.gene.agent.agent;
 
+import com.gene.agent.tool.approval.ApprovalRequest;
+
 import java.util.List;
 
 /**
@@ -46,6 +48,11 @@ public interface AgentListener {
     }
     /** 工具执行结果（或错误提示）。 */
     default void onObservation(String observation) {
+    }
+
+    /** 工具执行已暂停，等待人工审批。 */
+    default void onApprovalRequired(ApprovalRequest approval, String actionInput) {
+        onNotice("工具调用需要人工审批，审批单ID: " + approval.approvalId());
     }
 
     /** 格式错误、未知工具、步数用尽等状态提示。 */

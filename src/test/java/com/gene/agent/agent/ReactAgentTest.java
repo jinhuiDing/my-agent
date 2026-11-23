@@ -11,15 +11,24 @@ import com.gene.agent.core.AgentRunTerminationReason;
 import com.gene.agent.llm.LlmClient;
 import com.gene.agent.llm.LlmRequest;
 import com.gene.agent.output.AgentOutputParser;
+import com.gene.agent.runtime.AgentRunStore;
+import com.gene.agent.runtime.InMemoryAgentRunStore;
 import com.gene.agent.runtime.RunRegistry;
 import com.gene.agent.runtime.Step;
 import com.gene.agent.tool.Tool;
 import com.gene.agent.tool.ToolInputValidator;
 import com.gene.agent.tool.ToolRegistry;
+import com.gene.agent.tool.approval.ApprovalRequest;
+import com.gene.agent.tool.approval.ApprovalService;
+import com.gene.agent.tool.approval.InMemoryApprovalStore;
+import com.gene.agent.tool.policy.CompositeToolExecutionPolicy;
+import com.gene.agent.tool.policy.ToolExecutionDecision;
+import com.gene.agent.tool.policy.ToolExecutionPolicy;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.springframework.test.util.ReflectionTestUtils;
 
 import java.time.Duration;
 import java.util.List;
@@ -44,6 +53,8 @@ class ReactAgentTest {
     private ReActPrompt prompt;
     private AgentOutputParser parser;
     private ToolInputValidator toolInputValidator;
+    private ApprovalService approvalService;
+    private AgentRunStore agentRunStore;
 
     @BeforeEach
     void setUp() {
@@ -67,6 +78,8 @@ class ReactAgentTest {
         toolInput = new ObjectMapper().createObjectNode().put("param", "测试参数");
         toolInputValidator = mock(ToolInputValidator.class);
         runRegistry = new RunRegistry();
+        approvalService = new ApprovalService(new InMemoryApprovalStore());
+        agentRunStore = new InMemoryAgentRunStore();
         agent = createAgent(Duration.ofSeconds(30));
     }
 
@@ -75,6 +88,12 @@ class ReactAgentTest {
     }
 
     private ReactAgent createAgent(Duration runTimeout, Duration toolTimeout) {
+        return createAgent(runTimeout, toolTimeout,
+                (tool, input) -> ToolExecutionDecision.allow());
+    }
+
+    private ReactAgent createAgent(Duration runTimeout, Duration toolTimeout,
+                                   ToolExecutionPolicy executionPolicy) {
         AgentProperties properties = new AgentProperties(
                 "http://localhost",
                 "test-api-key",
@@ -88,15 +107,19 @@ class ReactAgentTest {
                 runTimeout,
                 false
         );
-        return new ReactAgent(
+        ReactAgent reactAgent = new ReactAgent(
                 llm,
+                new CompositeToolExecutionPolicy(List.of(executionPolicy)),
                 prompt,
                 parser,
                 tools,
                 properties,
                 toolInputValidator,
-                runRegistry
+                runRegistry,
+                approvalService
         );
+        ReflectionTestUtils.setField(reactAgent, "agentRunStore", agentRunStore);
+        return reactAgent;
     }
 
     @AfterEach
@@ -312,6 +335,33 @@ class ReactAgentTest {
             assertTrue(runRegistry.find(runId).isEmpty());
         } finally {
             executor.shutdownNow();
+        }
+    }
+
+    @Test
+    void shouldEmitStructuredApprovalEventAndSaveRun() {
+        ReactAgent approvalAgent = createAgent(
+                Duration.ofSeconds(30),
+                Duration.ofSeconds(5),
+                (tool, input) -> ToolExecutionDecision.requireApproval("需要人工审批")
+        );
+        when(llm.completeStream(any(), any())).thenReturn("""
+                {"type":"action","thought":"调用测试工具","action":{"name":"test_tool","input":{"param":"测试参数"}}}
+                """);
+
+        try {
+            AgentRunResult result = approvalAgent.run("等待审批", listener);
+
+            assertFalse(result.solved());
+            assertEquals("waiting_approval", result.stopReason());
+            assertEquals(1, approvalService.getPendingApprovals().size());
+            ApprovalRequest approval = approvalService.getPendingApprovals().get(0);
+            assertEquals(result.runId(), approval.runId());
+            assertNotNull(agentRunStore.findById(result.runId()));
+            verify(listener).onApprovalRequired(approval, toolInput.toPrettyString());
+            verify(tool, never()).execute(any(JsonNode.class));
+        } finally {
+            approvalAgent.shutdown();
         }
     }
 

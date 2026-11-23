@@ -40,6 +40,14 @@
   .empty { color: var(--muted); font-size: 14px; margin: 8px 0; }
   .empty code { background: #eef2ff; color: #3730a3; padding: 1px 6px; border-radius: 6px; font-size: 13px; }
   .step { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; }
+  .approval { border-color: #f59e0b; }
+  .approval .step-head { color: var(--amber); }
+  .approval-actions { display: flex; gap: 8px; align-items: center; margin-top: 12px; }
+  .approval-actions button { padding: 7px 14px; font-size: 13px; color: #fff; }
+  .approval-actions .approve { background: var(--green); }
+  .approval-actions .reject { background: var(--red); }
+  .approval-actions button:disabled { opacity: .55; cursor: default; }
+  .approval-status { color: var(--muted); font-size: 12px; margin-top: 8px; }
   .step-head {
     color: var(--muted); font-size: 12px; font-weight: 600;
     letter-spacing: .05em; margin-bottom: 8px;
@@ -124,6 +132,7 @@
   let statusKind = '';
   let startedAt = 0;
   let gotDone = false;
+  const approvalCards = new Map();
 
   const el = (tag, cls, text) => {
     const node = document.createElement(tag);
@@ -177,6 +186,11 @@
 
   function onDone(data) {
     gotDone = true;
+    if (data.stopReason === 'waiting_approval') {
+      setStatus('等待人工审批', 'run');
+      scrollDown();
+      return;
+    }
     const card = el('section', 'final');
     card.append(el('div', 'label', '最终回答'));
     card.append(el('div', 'answer', data.answer || '(无)'));
@@ -187,6 +201,84 @@
     traceEl.append(card);
     setStatus(data.solved ? '完成' : '步数用尽', data.solved ? 'ok' : 'run');
     scrollDown();
+  }
+
+  function showApproval(data) {
+    if (!data.approvalId || approvalCards.has(data.approvalId)) return;
+    const card = el('section', 'step approval');
+    card.append(el('div', 'step-head', '人工审批 · ' + data.approvalId));
+    addBlock(card, 'tool', '待执行工具 · ' + data.tool, data.input || '(无参数)');
+    addBlock(card, 'notice', '审批原因', data.reason || '(未提供)');
+
+    const actions = el('div', 'approval-actions');
+    const approveBtn = el('button', 'approve', '批准');
+    const rejectBtn = el('button', 'reject', '拒绝');
+    approveBtn.type = 'button';
+    rejectBtn.type = 'button';
+    actions.append(approveBtn, rejectBtn);
+    card.append(actions);
+    const status = el('div', 'approval-status', '等待审批');
+    card.append(status);
+    traceEl.append(card);
+    approvalCards.set(data.approvalId, { card, status, approveBtn, rejectBtn });
+
+    approveBtn.addEventListener('click', () => reviewApproval(data.approvalId, 'approve'));
+    rejectBtn.addEventListener('click', () => reviewApproval(data.approvalId, 'reject'));
+    setStatus('等待人工审批', 'run');
+    scrollDown();
+  }
+
+  async function loadPendingApprovals(runId) {
+    try {
+      const res = await fetch('/api/approvals');
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const approvals = await res.json();
+      approvals
+        .filter(item => item.runId === runId && item.status === 'PENDING')
+        .forEach(item => showApproval({
+          runId: item.runId,
+          approvalId: item.approvalId,
+          tool: item.toolName,
+          input: item.toolInput == null ? '{}' : JSON.stringify(item.toolInput, null, 2),
+          reason: item.reason
+        }));
+    } catch (err) {
+      addBlock(traceEl, 'error', '审批单加载失败', err.message || String(err));
+    }
+  }
+
+  async function reviewApproval(approvalId, decision) {
+    const entry = approvalCards.get(approvalId);
+    if (!entry) return;
+    entry.approveBtn.disabled = true;
+    entry.rejectBtn.disabled = true;
+    entry.status.textContent = '正在提交审批…';
+
+    try {
+      const res = await fetch('/api/approvals/' + encodeURIComponent(approvalId) + '/' + decision, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ reviewer: 'web', comment: '' })
+      });
+      const result = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(result.error || result.message || ('HTTP ' + res.status));
+
+      entry.status.textContent = decision === 'approve' ? '已批准，运行已继续' : '已拒绝，运行已继续';
+      if (result.stopReason === 'waiting_approval') {
+        setStatus('等待人工审批', 'run');
+        await loadPendingApprovals(result.runId);
+      } else {
+        onDone({
+          ...result,
+          stepCount: Array.isArray(result.steps) ? result.steps.length : 0
+        });
+      }
+    } catch (err) {
+      entry.status.textContent = '审批提交失败';
+      entry.approveBtn.disabled = false;
+      entry.rejectBtn.disabled = false;
+      addBlock(entry.card, 'error', '审批失败', err.message || String(err));
+    }
   }
 
   function handleEvent(name, data) {
@@ -205,6 +297,9 @@
         break;
       case 'observation':
         addBlock(stepCard ? stepCard.card : traceEl, 'observation', '工具结果', data.text);
+        break;
+      case 'approval_required':
+        showApproval(data);
         break;
       case 'notice':
         addBlock(stepCard ? stepCard.card : traceEl, 'notice', '提示', data.message);
@@ -245,6 +340,7 @@
     running = true;
     gotDone = false;
     stepCard = null;
+    approvalCards.clear();
     startedAt = Date.now();
     sendBtn.disabled = true;
     stopBtn.hidden = false;

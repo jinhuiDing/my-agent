@@ -153,7 +153,8 @@ public class ReactAgent {
                             thought, actionName, action.input(), actionInput, result.approvalId());
                     context.waitForApproval(result.approvalId(), pending);
                     agentRunStore.save(context);
-                    listener.onNotice(result.output());
+                    ApprovalRequest approval = approvalService.get(result.approvalId());
+                    listener.onApprovalRequired(approval, actionInput);
                     return waitingForApproval(context, result.output(), listener);
                 }
 

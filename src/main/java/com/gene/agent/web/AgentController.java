@@ -12,6 +12,7 @@ import com.gene.agent.core.AgentRunTerminationReason;
 import com.gene.agent.runtime.AgentRunContext;
 import com.gene.agent.runtime.RunRegistry;
 import com.gene.agent.tool.ToolRegistry;
+import com.gene.agent.tool.approval.ApprovalRequest;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.core.task.TaskExecutor;
@@ -33,7 +34,7 @@ import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
  * 一次性返回：
  * curl -X POST localhost:8080/api/agent/ask -H "Content-Type: application/json" -d "{\"question\":\"美元兑人民币汇率乘以1.13等于多少\"}"
  *
- * 流式返回（SSE，事件: start / step / delta / action / tool_start / tool_complete / observation / notice / done / error）：
+ * 流式返回（SSE，事件: start / step / delta / action / tool_start / tool_complete / observation / approval_required / notice / done / error）：
  * curl -N -X POST localhost:8080/api/agent/ask/stream -H "Content-Type: application/json" -d "{\"question\":\"...\"}"
  */
 @RestController
@@ -220,6 +221,16 @@ class AgentController {
         @Override
         public void onObservation(String observation) {
             send("observation", Map.of("text", observation == null ? "" : observation));
+        }
+
+        @Override
+        public void onApprovalRequired(ApprovalRequest approval, String actionInput) {
+            send("approval_required", Map.of(
+                    "runId", approval.runId(),
+                    "approvalId", approval.approvalId(),
+                    "tool", approval.toolName(),
+                    "input", actionInput == null ? "" : actionInput,
+                    "reason", approval.reason() == null ? "" : approval.reason()));
         }
 
         @Override
