@@ -1,5 +1,7 @@
 package com.gene.agent.agent;
 
+import com.gene.agent.runtime.Step;
+
 import java.util.List;
 
 public record AgentRunResult(String runId, String question, String answer, List<Step> steps, boolean solved, String stopReason) {

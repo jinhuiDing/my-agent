@@ -2,6 +2,7 @@ package com.gene.agent.agent;
 
 import java.util.List;
 
+import com.gene.agent.runtime.Step;
 import com.gene.agent.tool.ToolRegistry;
 import org.springframework.stereotype.Component;
 

@@ -1,11 +1,11 @@
-package com.gene.agent.agent;
+package com.gene.agent.runtime;
 
 /**
  * 一轮 "思考-行动-观察"。history 就是这个 record 的列表，拼 prompt 时按顺序渲染。
  */
 public record Step(String thought, String action, String actionInput, String observation) {
 
-    String toPromptBlock(int index) {
+    public String toPromptBlock(int index) {
         StringBuilder sb = new StringBuilder();
         sb.append("步骤 ").append(index).append('\n');
         if (thought != null && !thought.isBlank()) {

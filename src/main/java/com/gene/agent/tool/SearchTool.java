@@ -66,23 +66,11 @@ public class SearchTool implements Tool {
         query.put("type", "string");
         query.put("description", "搜索关键字");
 
-        schema.putArray("required").add("city");
+        schema.putArray("required").add("query");
         schema.put("additionalProperties", false);
 
         return schema;
-//        return objectMapper.readTree("""
-//        {
-//          "type": "object",
-//          "properties": {
-//            "city": {
-//              "type": "string",
-//              "description": "城市名称"
-//            }
-//          },
-//          "required": ["city"],
-//          "additionalProperties": false
-//        }
-//        """);
+
     }
     @Override
     public String name() {

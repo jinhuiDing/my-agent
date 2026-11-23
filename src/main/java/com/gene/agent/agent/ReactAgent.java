@@ -10,7 +10,6 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
-import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.gene.agent.config.AgentProperties;
@@ -23,6 +22,7 @@ import com.gene.agent.output.*;
 import com.gene.agent.runtime.AgentRunContext;
 import com.gene.agent.llm.LlmClient;
 import com.gene.agent.runtime.RunRegistry;
+import com.gene.agent.runtime.Step;
 import com.gene.agent.tool.Tool;
 import com.gene.agent.tool.ToolInputValidator;
 import com.gene.agent.tool.ToolRegistry;

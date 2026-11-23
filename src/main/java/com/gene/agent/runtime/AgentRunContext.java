@@ -1,6 +1,5 @@
 package com.gene.agent.runtime;
 
-import com.gene.agent.agent.Step;
 import com.gene.agent.core.AgentRunTerminationReason;
 
 import java.time.Instant;

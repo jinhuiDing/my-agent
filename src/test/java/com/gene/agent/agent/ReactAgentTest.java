@@ -12,6 +12,7 @@ import com.gene.agent.llm.LlmClient;
 import com.gene.agent.llm.LlmRequest;
 import com.gene.agent.output.AgentOutputParser;
 import com.gene.agent.runtime.RunRegistry;
+import com.gene.agent.runtime.Step;
 import com.gene.agent.tool.Tool;
 import com.gene.agent.tool.ToolInputValidator;
 import com.gene.agent.tool.ToolRegistry;
